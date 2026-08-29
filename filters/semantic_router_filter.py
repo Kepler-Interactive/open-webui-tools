@@ -1238,11 +1238,11 @@ class Filter:
 
             model_data = selected_model_full
             meta = model_data.get("meta", {})
-            knowledge = meta.get("knowledge", [])
+            knowledge = meta.get("knowledge")
+            if not isinstance(knowledge, list):
+                knowledge = []
 
-            self._routed_model_knowledge = (
-                knowledge if isinstance(knowledge, list) else []
-            )
+            self._routed_model_knowledge = knowledge
             self._routed_model_tools = meta.get("toolIds", [])
 
             if self.valves.debug:
