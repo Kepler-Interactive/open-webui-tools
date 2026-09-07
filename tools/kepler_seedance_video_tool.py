@@ -3,7 +3,7 @@ title: Kepler Video Generator (Seedance)
 description: Generate, extend and edit short videos with ByteDance Seedance from text, attached images, reference images/audio/video. Talks to BytePlus ModelArk directly (default) or Atlas Cloud.
 author: Kepler Interactive (forked from the Atlas Cloud Media Generator by binyangzhu000-sudo & Haervwe)
 author_url: https://github.com/Kepler-Interactive/open-webui-tools
-version: 0.7.1
+version: 0.8.0
 license: MIT
 required_open_webui_version: 0.9.1
 """
@@ -463,6 +463,25 @@ class Tools:
             with open(out, "rb") as fh:
                 return fh.read()
 
+    @staticmethod
+    def _last_frame_jpeg(video: bytes) -> bytes:
+        """Grab the final frame of an MP4 as JPEG bytes (used to anchor continuations)."""
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise VideoGenError("ffmpeg is not available on the server")
+        with tempfile.TemporaryDirectory(prefix="kepler_seedance_") as tmp:
+            src, out = os.path.join(tmp, "src.mp4"), os.path.join(tmp, "last.jpg")
+            with open(src, "wb") as fh:
+                fh.write(video)
+            res = subprocess.run(
+                [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-sseof", "-0.1", "-i", src, "-frames:v", "1", "-q:v", "2", out],
+                capture_output=True, text=True, timeout=120,
+            )
+            if res.returncode != 0 or not os.path.exists(out):
+                raise VideoGenError(f"ffmpeg last-frame extraction failed: {(res.stderr or '').strip()[-200:]}")
+            with open(out, "rb") as fh:
+                return fh.read()
+
     async def _read_file_bytes(self, file: Any, fallback_url: Optional[str]) -> bytes:
         if file is not None and getattr(file, "path", None):
             try:
@@ -882,7 +901,7 @@ class Tools:
                 if join_source and config["join_extensions"]:
                     await self._emit_status(emitter, "Stitching source and continuation into one clip", done=False)
                     try:
-                        src_bytes = await self._read_file_bytes(join_source.get("file"), join_source.get("url"))
+                        src_bytes = join_source.get("bytes") or await self._read_file_bytes(join_source.get("file"), join_source.get("url"))
                         data = await asyncio.to_thread(self._concat_videos, src_bytes, data)
                         content_type = "video/mp4"
                         joined = True
@@ -1155,12 +1174,33 @@ class Tools:
             src_url, src_meta, src_file = await self._resolve_video_source(src, user_id, chat_id)
         except VideoGenError as exc:
             return f"Cannot extend: {exc}"
-        text = prompt.strip()
+
+        # Anchor the continuation on the source's final frame. Tested 2026-09-07: a reference video
+        # alone gives a thematic continuation with a visible jump at the cut; adding the last frame as
+        # a reference image makes the first frames line up almost exactly (ModelArk refuses a
+        # first_frame role alongside reference media, so reference_image is the only way).
+        src_bytes: Optional[bytes] = None
+        ref_images: List[MediaRef] = []
+        try:
+            await self._emit_status(__event_emitter__, "Reading the source clip's last frame", done=False)
+            src_bytes = await self._read_file_bytes(src_file, src_url)
+            jpg = await asyncio.to_thread(self._last_frame_jpeg, src_bytes)
+            ref_images = [MediaRef(data=jpg, mime="image/jpeg", name="last_frame.jpg")]
+        except Exception as exc:
+            log.warning("kepler_seedance_video: could not extract last frame (%s); extending from the video alone", exc)
+
+        text = prompt.strip().rstrip(".")
         if not VIDEO1_RE.search(text):
-            text = (
-                f"Extend Video 1 forward: {text.rstrip('.')}. Keep the same subject, setting, camera angle, "
-                "lighting and visual style as Video 1 so the continuation cuts together seamlessly."
-            )
+            if ref_images:
+                text = (
+                    f"Image 1 is the exact last frame of Video 1. Continue seamlessly from Image 1: {text}. "
+                    "Keep the same subject, setting, camera angle, lighting and visual style as Video 1."
+                )
+            else:
+                text = (
+                    f"Extend Video 1 forward: {text}. Keep the same subject, setting, camera angle, "
+                    "lighting and visual style as Video 1 so the continuation cuts together seamlessly."
+                )
         params = {
             "duration": self._clamp_duration(duration, config),
             "resolution": self._clamp_resolution(resolution or src_meta.get("resolution"), config),
@@ -1169,8 +1209,8 @@ class Tools:
         }
         return await self._generate(
             config, __event_emitter__, __user__, "Extending video", quality or src_meta.get("tier") or "", "extend", text, params,
-            ref_videos=[src_url], chat_id=chat_id, source_url=src_url,
-            join_source={"url": src_url, "file": src_file, "duration": src_meta.get("duration")},
+            ref_images=ref_images, ref_videos=[src_url], chat_id=chat_id, source_url=src_url,
+            join_source={"url": src_url, "file": src_file, "bytes": src_bytes, "duration": src_meta.get("duration")},
         )
 
     async def edit_video(
