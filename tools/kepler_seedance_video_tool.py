@@ -3,7 +3,7 @@ title: Kepler Video Generator (Seedance)
 description: Generate, extend and edit short videos with ByteDance Seedance from text, attached images, reference images/audio/video. Talks to BytePlus ModelArk directly (default) or Atlas Cloud.
 author: Kepler Interactive (forked from the Atlas Cloud Media Generator by binyangzhu000-sudo & Haervwe)
 author_url: https://github.com/Kepler-Interactive/open-webui-tools
-version: 0.9.0
+version: 0.10.0
 license: MIT
 required_open_webui_version: 0.9.1
 """
@@ -153,7 +153,8 @@ class Tools:
         ATLAS_REFERENCE_MODEL: str = Field(default=ATLAS_REFERENCE_MODEL)
         DEFAULT_DURATION_SECONDS: int = Field(default=5, ge=4, le=30)
         MAX_DURATION_SECONDS: int = Field(
-            default=10, ge=4, le=30, description="Hard cap on clip length to keep costs predictable."
+            default=30, ge=4, le=30,
+            description="Hard cap on clip length (cost control). Seedance 2.0 models are further limited to 15s by the API; 2.5 allows 30s.",
         )
         ALLOWED_RESOLUTIONS: str = Field(
             default="480p,720p,1080p",
@@ -173,12 +174,16 @@ class Tools:
             default=True,
             description="After extend_video, stitch source + continuation into one clip with ffmpeg (needs ffmpeg in the container).",
         )
+        JOIN_CUT_SEARCH_SECONDS: float = Field(
+            default=1.5, ge=0.0, le=4.0,
+            description="Search this many seconds at the start of a continuation for the frame that best matches the source's last frame, skip the near-static onset, and cut there. 0 disables.",
+        )
         JOIN_CROSSFADE_SECONDS: float = Field(
-            default=0.5, ge=0.0, le=2.0,
-            description="Crossfade length across the stitch so water/motion phase differences at the seam dissolve instead of cutting. 0 = hard cut.",
+            default=0.2, ge=0.0, le=2.0,
+            description="Short crossfade at the chosen cut point to hide residual motion-phase differences. 0 = hard cut.",
         )
         MAX_RERENDER_SECONDS: int = Field(
-            default=15, ge=4, le=30,
+            default=30, ge=4, le=30,
             description="Longest clip rerender_video will re-render in high fidelity (cost control; hifi with a video input costs ~2x per second).",
         )
         EMBED_SAVED_COPY: bool = Field(
@@ -240,6 +245,7 @@ class Tools:
             "save_to_openwebui": self.valves.SAVE_TO_OPENWEBUI,
             "join_extensions": self.valves.JOIN_EXTENSIONS,
             "join_crossfade": float(self.valves.JOIN_CROSSFADE_SECONDS),
+            "join_cut_search": float(self.valves.JOIN_CUT_SEARCH_SECONDS),
             "max_rerender": int(self.valves.MAX_RERENDER_SECONDS),
             "embed_saved_copy": self.valves.EMBED_SAVED_COPY,
             "signed_link_ttl": int(self.valves.SIGNED_LINK_TTL_DAYS) * 24 * 3600,
@@ -475,10 +481,51 @@ class Tools:
         info["has_audio"] = "Audio:" in banner
         return info
 
-    def _concat_videos(self, first: bytes, second: bytes, crossfade: float = 0.0) -> Tuple[bytes, float]:
+    @staticmethod
+    def _gray_frames(ffmpeg: str, path: str, args: List[str], w: int = 160, h: int = 90, fps: int = 24) -> List[bytes]:
+        """Decode frames as tiny 8-bit grayscale rasters for cheap pixel comparisons."""
+        res = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", *args, "-i", path, "-vf", f"fps={fps},scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+            capture_output=True, timeout=120,
+        )
+        n = w * h
+        raw = res.stdout or b""
+        return [raw[i:i + n] for i in range(0, len(raw) - n + 1, n)]
+
+    @staticmethod
+    def _mad(a: bytes, b: bytes) -> float:
+        """Mean absolute difference of two equal-length gray rasters (0-255)."""
+        if not a or not b or len(a) != len(b):
+            return 255.0
+        return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+
+    def _best_cut_point(self, ffmpeg: str, a: str, b: str, window_s: float, fps: int = 24) -> Tuple[float, Dict[str, Any]]:
+        """Where to start the continuation so it joins the source most seamlessly.
+
+        Technique (as used by the community for Seedance extensions): compare every frame in the first
+        `window_s` of the continuation with the source's final frame and pick the closest one, then skip
+        the near-static frames the model tends to produce right after that point so motion resumes at once.
+        Returns (start offset in seconds, debug info)."""
+        last = self._gray_frames(ffmpeg, a, ["-sseof", "-0.15"])
+        head = self._gray_frames(ffmpeg, b, ["-t", str(window_s)])
+        if not last or len(head) < 3:
+            return 0.0, {"reason": "no frames"}
+        ref = last[-1]
+        diffs = [self._mad(ref, f) for f in head]
+        best = min(range(len(diffs)), key=lambda i: diffs[i])
+        # Skip stalled frames after the match: advance while consecutive frames barely change.
+        motion = [self._mad(head[i], head[i + 1]) for i in range(len(head) - 1)]
+        typical = sorted(motion)[len(motion) // 2] if motion else 0.0
+        stall_eps = max(0.35, typical * 0.35)
+        j = best
+        while j < len(motion) and motion[j] < stall_eps and j - best < fps:  # never skip more than 1s
+            j += 1
+        return round(j / fps, 3), {"best_match_frame": best, "match_diff": round(diffs[best], 2), "start_frame": j, "typical_motion": round(typical, 2)}
+
+    def _concat_videos(self, first: bytes, second: bytes, crossfade: float = 0.0, cut_search: float = 0.0) -> Tuple[bytes, float]:
         """Stitch two MP4s back to back (re-encoded so mismatched params never break the join).
-        With crossfade > 0 the seam is a short dissolve, which hides motion-phase jumps (ripples, etc.).
-        Returns (mp4 bytes, total duration seconds)."""
+        cut_search > 0: trim the continuation to its best-matching, motion-resumed frame first.
+        crossfade > 0: short dissolve at the seam. Returns (mp4 bytes, total duration seconds)."""
         ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
         if not ffmpeg:
             raise VideoGenError("ffmpeg is not available on the server")
@@ -490,28 +537,43 @@ class Tools:
                 fh.write(second)
             pa, pb = self._probe(ffmpeg, ffprobe, a), self._probe(ffmpeg, ffprobe, b)
             w, h = (pa["width"] or pb["width"] or 1280), (pa["height"] or pb["height"] or 720)
-            scale = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24"
             with_audio = pa["has_audio"] and pb["has_audio"]
             da, db = float(pa["duration"] or 0), float(pb["duration"] or 0)
+
+            cut = 0.0
+            if cut_search and cut_search > 0.1 and db > cut_search + 1.0:
+                try:
+                    cut, info = self._best_cut_point(ffmpeg, a, b, cut_search)
+                    log.info("kepler_seedance_video: stitch cut point %.3fs into continuation (%s)", cut, info)
+                except Exception as exc:
+                    log.warning("kepler_seedance_video: cut-point search failed (%s); joining at frame 0", exc)
+                    cut = 0.0
+            db_eff = max(db - cut, 0.5)
+            self._last_cut = cut
+
+            trim_v = f"trim=start={cut},setpts=PTS-STARTPTS," if cut > 0 else ""
+            trim_a = f"atrim=start={cut},asetpts=PTS-STARTPTS," if cut > 0 else ""
+            scale = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24"
             xf = min(float(crossfade or 0), 2.0)
-            use_xfade = xf > 0.05 and da > xf + 0.5 and db > xf + 0.5
+            use_xfade = xf > 0.04 and da > xf + 0.5 and db_eff > xf + 0.5
             if use_xfade:
                 off = round(da - xf, 3)
-                total = da + db - xf
+                total = da + db_eff - xf
                 if with_audio:
-                    fc = (f"[0:v]{scale}[v0];[1:v]{scale}[v1];[v0][v1]xfade=transition=fade:duration={xf}:offset={off}[v];"
-                          f"[0:a]aresample=48000[a0];[1:a]aresample=48000[a1];[a0][a1]acrossfade=d={xf}[a]")
+                    fc = (f"[0:v]{scale}[v0];[1:v]{trim_v}{scale}[v1];[v0][v1]xfade=transition=fade:duration={xf}:offset={off}[v];"
+                          f"[0:a]aresample=48000[a0];[1:a]{trim_a}aresample=48000[a1];[a0][a1]acrossfade=d={xf}[a]")
                     maps = ["-map", "[v]", "-map", "[a]", "-c:a", "aac", "-b:a", "128k"]
                 else:
-                    fc = f"[0:v]{scale}[v0];[1:v]{scale}[v1];[v0][v1]xfade=transition=fade:duration={xf}:offset={off}[v]"
+                    fc = f"[0:v]{scale}[v0];[1:v]{trim_v}{scale}[v1];[v0][v1]xfade=transition=fade:duration={xf}:offset={off}[v]"
                     maps = ["-map", "[v]", "-an"]
             else:
-                total = da + db
+                total = da + db_eff
                 if with_audio:
-                    fc = f"[0:v]{scale}[v0];[1:v]{scale}[v1];[0:a]aresample=48000[a0];[1:a]aresample=48000[a1];[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]"
+                    fc = (f"[0:v]{scale}[v0];[1:v]{trim_v}{scale}[v1];[0:a]aresample=48000[a0];[1:a]{trim_a}aresample=48000[a1];"
+                          f"[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]")
                     maps = ["-map", "[v]", "-map", "[a]", "-c:a", "aac", "-b:a", "128k"]
                 else:
-                    fc = f"[0:v]{scale}[v0];[1:v]{scale}[v1];[v0][v1]concat=n=2:v=1:a=0[v]"
+                    fc = f"[0:v]{scale}[v0];[1:v]{trim_v}{scale}[v1];[v0][v1]concat=n=2:v=1:a=0[v]"
                     maps = ["-map", "[v]", "-an"]
             cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", a, "-i", b, "-filter_complex", fc, *maps,
                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart", out]
@@ -919,6 +981,12 @@ class Tools:
             }[mode]
             runner = self._atlas_generate
 
+        # API limits per model family: Seedance 2.0 (draft/mini) tops out at 15s, 2.5 at 30s.
+        model_max = 30 if tier == "hifi" else 15
+        if params["duration"] > model_max:
+            await self._emit_status(emitter, f"{model} supports at most {model_max}s per clip; using {model_max}s", done=False)
+            params["duration"] = model_max
+
         # Wall-time estimate for the progress bar (the API gives no percentage).
         rate = EST_SECONDS_PER_VIDEO_SECOND.get(params["resolution"], 25.0)
         audio_factor = 1.15 if params.get("generate_audio") else 1.0
@@ -961,7 +1029,9 @@ class Tools:
                     await self._emit_status(emitter, "Stitching source and continuation into one clip", done=False)
                     try:
                         src_bytes = join_source.get("bytes") or await self._read_file_bytes(join_source.get("file"), join_source.get("url"))
-                        data, joined_secs = await asyncio.to_thread(self._concat_videos, src_bytes, data, config["join_crossfade"])
+                        data, joined_secs = await asyncio.to_thread(
+                            self._concat_videos, src_bytes, data, config["join_crossfade"], config["join_cut_search"]
+                        )
                         content_type = "video/mp4"
                         joined = True
                         total_duration = int(round(joined_secs)) if joined_secs else int(join_source.get("duration") or 0) + params["duration"]
