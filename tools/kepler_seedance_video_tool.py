@@ -3,7 +3,7 @@ title: Kepler Video Generator (Seedance)
 description: Generate short videos from a text prompt, an attached image, or several reference images/audio clips with ByteDance Seedance. Talks to BytePlus ModelArk directly (default) or Atlas Cloud.
 author: Kepler Interactive (forked from the Atlas Cloud Media Generator by binyangzhu000-sudo & Haervwe)
 author_url: https://github.com/Kepler-Interactive/open-webui-tools
-version: 0.2.0
+version: 0.3.0
 license: MIT
 required_open_webui_version: 0.9.1
 """
@@ -27,6 +27,7 @@ required_open_webui_version: 0.9.1
 import asyncio
 import base64
 import io
+import logging
 import re
 import time
 import uuid
@@ -40,8 +41,18 @@ from pydantic import BaseModel, Field
 # --- BytePlus ModelArk (ByteDance first-party, international) ---------------
 BYTEPLUS_BASE_URL = "https://ark.ap-southeast.bytepluses.com/api/v3"
 BYTEPLUS_TASKS_PATH = "/contents/generations/tasks"
+BYTEPLUS_MINI_MODEL = "dreamina-seedance-2-0-mini-260615"
 BYTEPLUS_FAST_MODEL = "dreamina-seedance-2-0-fast-260128"
 BYTEPLUS_BEST_MODEL = "dreamina-seedance-2-5-260628"
+
+# Observed render throughput on ModelArk (seconds of wall time per second of video), used only
+# to show an *estimated* progress bar - the API reports no percentage. Measured 2026-09-07:
+# 4s@480p no audio -> 70s, 5s@720p with audio -> 124s (Seedance 2.0 Fast).
+EST_SECONDS_PER_VIDEO_SECOND = {"480p": 15.0, "720p": 20.0, "1080p": 38.0}
+EST_OVERHEAD_SECONDS = 8.0
+EST_MODEL_FACTOR = {"mini": 0.7, "fast": 1.0, "best": 1.6}
+
+log = logging.getLogger("kepler_seedance_video")
 
 # --- Atlas Cloud (reseller) --------------------------------------------------
 ATLAS_BASE_URL = "https://api.atlascloud.ai/api/v1"
@@ -102,6 +113,7 @@ class Tools:
             json_schema_extra={"input": {"type": "password"}},
         )
         BYTEPLUS_BASE_URL: str = Field(default=BYTEPLUS_BASE_URL, description="ModelArk base URL (ap-southeast region).")
+        BYTEPLUS_MINI_MODEL: str = Field(default=BYTEPLUS_MINI_MODEL, description="ModelArk model for quality='mini' (cheapest).")
         BYTEPLUS_FAST_MODEL: str = Field(default=BYTEPLUS_FAST_MODEL, description="ModelArk model for quality='fast'.")
         BYTEPLUS_BEST_MODEL: str = Field(default=BYTEPLUS_BEST_MODEL, description="ModelArk model for quality='best'.")
         ATLASCLOUD_API_KEY: str = Field(
@@ -157,6 +169,7 @@ class Tools:
             "provider": provider,
             "api_key": user_key or shared_key.strip(),
             "byteplus_base_url": self.valves.BYTEPLUS_BASE_URL.rstrip("/"),
+            "byteplus_mini_model": self.valves.BYTEPLUS_MINI_MODEL,
             "byteplus_fast_model": self.valves.BYTEPLUS_FAST_MODEL,
             "byteplus_best_model": self.valves.BYTEPLUS_BEST_MODEL,
             "atlas_base_url": self.valves.ATLAS_BASE_URL.rstrip("/"),
@@ -199,6 +212,24 @@ class Tools:
     async def _emit_status(self, emitter: EventEmitter, description: str, *, done: bool) -> None:
         if emitter:
             await emitter({"type": "status", "data": {"description": description, "done": done}})
+
+    async def _emit_progress(
+        self, emitter: EventEmitter, label: str, status: str, started: float, config: Dict[str, Any]
+    ) -> None:
+        """Status line with an ESTIMATED progress bar. The provider reports no percentage, so this is
+        elapsed time against a throughput estimate; it parks at 95% if the render runs long."""
+        elapsed = time.monotonic() - started
+        est = float(config.get("est_total") or 0)
+        if est <= 0:
+            await self._emit_status(emitter, f"{label}: {status or 'queued'} ({int(elapsed)}s elapsed)", done=False)
+            return
+        frac = min(elapsed / est, 0.95)
+        filled = int(round(frac * 10))
+        bar = "▰" * filled + "▱" * (10 - filled)
+        tail = "taking longer than usual" if elapsed > est else f"{int(elapsed)}s of ~{int(est)}s"
+        await self._emit_status(
+            emitter, f"{label}: {bar} ~{int(frac * 100)}% · {tail} (estimate) · {status or 'queued'}", done=False
+        )
 
     # ------------------------------------------------------------------ http
 
@@ -383,10 +414,9 @@ class Tools:
                     err = task.get("error") or {}
                     detail = err.get("message") if isinstance(err, dict) else err
                     raise VideoGenError(f"Generation failed: {detail or status}")
-                elapsed = int(time.monotonic() - started)
-                if status != last_status or time.monotonic() - last_emit >= 15:
+                if status != last_status or time.monotonic() - last_emit >= 10:
                     last_status, last_emit = status, time.monotonic()
-                    await self._emit_status(emitter, f"{label}: {status or 'queued'} ({elapsed}s elapsed)", done=False)
+                    await self._emit_progress(emitter, label, status, started, config)
         raise VideoGenError("Generation timed out. Try a shorter clip or lower resolution.")
 
     async def _atlas_upload(self, session: aiohttp.ClientSession, base: str, ref: MediaRef) -> str:
@@ -450,10 +480,9 @@ class Tools:
                     return outputs[0]
                 if status in FAILED_STATUSES:
                     raise VideoGenError(f"Generation failed: {pred.get('error') or pred.get('message') or status}")
-                elapsed = int(time.monotonic() - started)
-                if status != last_status or time.monotonic() - last_emit >= 15:
+                if status != last_status or time.monotonic() - last_emit >= 10:
                     last_status, last_emit = status, time.monotonic()
-                    await self._emit_status(emitter, f"{label}: {status or 'processing'} ({elapsed}s elapsed)", done=False)
+                    await self._emit_progress(emitter, label, status, started, config)
         raise VideoGenError("Generation timed out. Try a shorter clip or lower resolution.")
 
     # ------------------------------------------------------------------ media out
@@ -489,12 +518,20 @@ class Tools:
         )
         return f"/api/v1/files/{file_id}/content"
 
-    def _render(self, provider_url: str, saved_url: Optional[str], config: Dict[str, Any], summary: str) -> Union[str, Tuple[HTMLResponse, str]]:
-        keep_note = (
-            f"A permanent copy is saved in KeplerAI at {saved_url} (open it or attach it in later chats)."
-            if saved_url
-            else "The provider link expires in about 24 hours, so download the clip if you want to keep it."
-        )
+    def _render(
+        self,
+        provider_url: str,
+        saved_url: Optional[str],
+        config: Dict[str, Any],
+        summary: str,
+        save_error: Optional[str] = None,
+    ) -> Union[str, Tuple[HTMLResponse, str]]:
+        if saved_url:
+            keep_note = f"A permanent copy is saved in KeplerAI at {saved_url} (open it or attach it in later chats)."
+        else:
+            keep_note = "The provider link expires in about 24 hours, so download the clip if you want to keep it."
+            if save_error:
+                keep_note += f" (Saving a copy into KeplerAI failed: {save_error}; mention this to the user.)"
         context = f"{summary} Video URL: {provider_url}. {keep_note} Tell the user the clip is ready in one or two sentences."
         if config["return_html_embed"]:
             links = f'<a href="{provider_url}" target="_blank" rel="noopener">Download (provider link, ~24h)</a>'
@@ -531,40 +568,58 @@ class Tools:
             which = "BYTEPLUS_API_KEY" if config["provider"] == "byteplus" else "ATLASCLOUD_API_KEY"
             return f"Video generation is not configured yet: an admin must set {which} in the tool's Valves."
 
-        best = str(quality).lower().strip() == "best"
+        # Quality tier -> model. Multi-reference mode needs Seedance 2.5, so it always runs on 'best'.
+        tier = str(quality).lower().strip()
+        tier = tier if tier in ("mini", "fast", "best") else "fast"
+        if mode == "reference":
+            tier = "best"
         if config["provider"] == "byteplus":
-            # ModelArk uses one model for text / first-frame / reference modes.
-            # Reference mode (multi-asset) needs Seedance 2.5, so force 'best' there.
-            model = config["byteplus_best_model"] if (best or mode == "reference") else config["byteplus_fast_model"]
+            # ModelArk uses one model id for text / first-frame / reference inputs.
+            model = {
+                "mini": config["byteplus_mini_model"],
+                "fast": config["byteplus_fast_model"],
+                "best": config["byteplus_best_model"],
+            }[tier]
             runner = self._byteplus_generate
         else:
             model = {
-                "text": config["atlas_best_model"] if best else config["atlas_fast_model"],
+                "text": config["atlas_best_model"] if tier == "best" else config["atlas_fast_model"],
                 "image": config["atlas_image_to_video_model"],
                 "reference": config["atlas_reference_model"],
             }[mode]
             runner = self._atlas_generate
 
-        await self._emit_status(emitter, f"Submitting to {model} ({config['provider']})", done=False)
+        # Wall-time estimate for the progress bar (the API gives no percentage).
+        rate = EST_SECONDS_PER_VIDEO_SECOND.get(params["resolution"], 25.0)
+        audio_factor = 1.15 if params.get("generate_audio") else 1.0
+        config["est_total"] = EST_OVERHEAD_SECONDS + params["duration"] * rate * EST_MODEL_FACTOR[tier] * audio_factor
+
+        await self._emit_status(
+            emitter, f"Submitting to {model} ({config['provider']}, ~{int(config['est_total'])}s estimated)", done=False
+        )
         try:
             provider_url = await runner(config, emitter, label, model, prompt, params, first_frame, ref_images, ref_audios)
         except (VideoGenError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            log.warning("kepler_seedance_video: generation failed: %s", exc)
             await self._emit_status(emitter, f"Video generation error: {exc}", done=True)
             return f"Video generation failed: {exc}"
 
-        saved_url = None
+        saved_url, save_error = None, None
         if config["save_to_openwebui"]:
             await self._emit_status(emitter, "Saving video to KeplerAI storage", done=False)
             try:
                 saved_url = await self._save_to_openwebui(
                     provider_url, (user or {}).get("id"), f"seedance-{time.strftime('%Y%m%d-%H%M%S')}.mp4"
                 )
+                if not saved_url:
+                    save_error = "storage layer unavailable or no user id"
             except Exception as exc:  # saving is best-effort; the provider link still works
-                await self._emit_status(emitter, f"Could not save a copy ({exc}); provider link only", done=False)
+                save_error = str(exc)
+                log.exception("kepler_seedance_video: saving video into Open WebUI storage failed")
 
         await self._emit_status(emitter, f"{label}: done", done=True)
-        summary = f"Generated a {params['duration']}s {params['resolution']} clip with {model} via {config['provider']}."
-        return self._render(provider_url, saved_url, config, summary)
+        summary = f"Generated a {params['duration']}s {params['resolution']} clip with {model} ({tier} tier) via {config['provider']}."
+        return self._render(provider_url, saved_url, config, summary, save_error)
 
     async def _prepare_refs(self, emitter: EventEmitter, refs: List[str], kind: str) -> List[MediaRef]:
         if refs:
@@ -597,7 +652,7 @@ class Tools:
         :param resolution: 480p, 720p or 1080p. Default 720p.
         :param ratio: Aspect ratio: 16:9 (default), 9:16 for social/vertical, 1:1, 4:3, 3:4 or 21:9.
         :param generate_audio: Whether to generate synchronised sound, music and speech. Default true.
-        :param quality: "fast" (default, cheap, quick iteration) or "best" (Seedance 2.5, higher fidelity, several times the cost). Only use "best" when the user asks for high quality or a final version.
+        :param quality: "fast" (default, Seedance 2.0 Fast, good for iteration), "mini" (Seedance 2.0 Mini, cheapest and quickest, rougher look; use when the user says draft, rough, cheap or quick test) or "best" (Seedance 2.5, highest fidelity, several times the cost; only when the user asks for high quality or a final version).
         """
         config = self._resolve_config(__user__)
         params = {
@@ -631,7 +686,7 @@ class Tools:
         :param duration: Clip length in seconds (4-10). Default 5.
         :param resolution: 480p, 720p or 1080p. Default 720p.
         :param generate_audio: Whether to generate synchronised sound. Default true.
-        :param quality: "fast" (default) or "best" (Seedance 2.5).
+        :param quality: "fast" (default), "mini" (cheapest draft) or "best" (Seedance 2.5, highest fidelity).
         """
         config = self._resolve_config(__user__)
         target = image_url or next(iter(self._collect_media(__messages__, __files__, "image")), None)
