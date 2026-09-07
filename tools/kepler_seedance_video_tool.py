@@ -3,7 +3,7 @@ title: Kepler Video Generator (Seedance)
 description: Generate, extend and edit short videos with ByteDance Seedance from text, attached images, reference images/audio/video. Talks to BytePlus ModelArk directly (default) or Atlas Cloud.
 author: Kepler Interactive (forked from the Atlas Cloud Media Generator by binyangzhu000-sudo & Haervwe)
 author_url: https://github.com/Kepler-Interactive/open-webui-tools
-version: 0.5.0
+version: 0.5.1
 license: MIT
 required_open_webui_version: 0.9.1
 """
@@ -651,6 +651,7 @@ class Tools:
         summary: str,
         save_error: Optional[str] = None,
         usage_note: str = "",
+        ratio: str = "16:9",
     ) -> Union[str, Tuple[HTMLResponse, str]]:
         if saved_url:
             keep_note = (
@@ -670,10 +671,25 @@ class Tools:
             if saved_url:
                 links = f'<a href="{saved_url}" target="_blank" rel="noopener">Download (saved in KeplerAI)</a> &middot; ' + links
             usage_html = f'<span style="opacity:.75"> &middot; {usage_note}</span>' if usage_note else ""
+            # The chat measures this document's height once on load, before the <video> knows its
+            # dimensions, which yields a sliver. Reserve the box with aspect-ratio up front and also
+            # report our height to the parent (FullHeightIframe listens for 'iframe:height').
+            w, h = {"16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "4:3": (4, 3), "3:4": (3, 4), "21:9": (21, 9)}.get(
+                ratio, (16, 9)
+            )
+            max_h = 540 if h <= w else 640
             html = (
-                f'<video controls autoplay muted playsinline src="{provider_url}" width="960" '
-                f'style="max-width:100%;border-radius:8px"></video>'
-                f'<p style="font-family:sans-serif;font-size:12px">{links}{usage_html}</p>'
+                '<style>html,body{margin:0;padding:0;background:transparent}'
+                f'.wrap{{width:100%;max-width:{int(max_h * w / h)}px;aspect-ratio:{w}/{h};max-height:{max_h}px;margin:0 auto}}'
+                '.wrap video{width:100%;height:100%;display:block;object-fit:contain;background:#000;border-radius:10px}'
+                '.meta{font-family:system-ui,sans-serif;font-size:12px;margin:8px 4px 0;line-height:1.5}'
+                '.meta a{color:#3b82f6;text-decoration:none}.meta a:hover{text-decoration:underline}</style>'
+                f'<div class="wrap"><video id="v" controls autoplay muted playsinline preload="metadata" src="{provider_url}"></video></div>'
+                f'<p class="meta">{links}{usage_html}</p>'
+                "<script>(function(){function r(){try{var h=document.documentElement.scrollHeight;"
+                "parent.postMessage({type:'iframe:height',height:h+8},'*')}catch(e){}}"
+                "var v=document.getElementById('v');v.addEventListener('loadedmetadata',r);"
+                "window.addEventListener('load',r);window.addEventListener('resize',r);setTimeout(r,300);setTimeout(r,1500)})();</script>"
             )
             return HTMLResponse(content=html, headers={"content-disposition": "inline"}), context
         out = f"{summary} {usage_note}\n\n- [Provider link (expires ~24h)]({provider_url})"
@@ -743,9 +759,11 @@ class Tools:
         usage_note = ""
         if tokens:
             price = float(config["prices"].get(tier) or 0)
-            usage_note = f"{tokens:,} video tokens"
             if price > 0:
-                usage_note += f" (≈ ${tokens / 1_000_000 * price:.2f})"
+                # Cost first; the raw token count stays available in the file metadata for reporting.
+                usage_note = f"≈ ${tokens / 1_000_000 * price:.2f} this clip ({params['duration']}s {params['resolution']}, {tier})"
+            else:
+                usage_note = f"{tokens:,} video tokens ({params['duration']}s {params['resolution']}, {tier})"
         log.info(
             "kepler_seedance_video: %s mode=%s tier=%s model=%s duration=%ss res=%s tokens=%s task=%s user=%s chat=%s",
             config["provider"], mode, tier, model, params["duration"], params["resolution"], tokens,
@@ -795,7 +813,7 @@ class Tools:
             "edit": "Edited the source clip into",
         }.get(mode, "Generated")
         summary = f"{verb} a {params['duration']}s {params['resolution']} clip with {model} ({tier} tier) via {config['provider']}."
-        return self._render(provider_url, saved_url, config, summary, save_error, usage_note)
+        return self._render(provider_url, saved_url, config, summary, save_error, usage_note, params.get("ratio") or "16:9")
 
     async def _prepare_refs(self, emitter: EventEmitter, refs: List[str], kind: str) -> List[MediaRef]:
         if refs:
