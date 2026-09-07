@@ -3,7 +3,7 @@ title: Kepler Video Generator (Seedance)
 description: Generate, extend and edit short videos with ByteDance Seedance from text, attached images, reference images/audio/video. Talks to BytePlus ModelArk directly (default) or Atlas Cloud.
 author: Kepler Interactive (forked from the Atlas Cloud Media Generator by binyangzhu000-sudo & Haervwe)
 author_url: https://github.com/Kepler-Interactive/open-webui-tools
-version: 0.11.0
+version: 0.11.1
 license: MIT
 required_open_webui_version: 0.9.1
 """
@@ -179,8 +179,8 @@ class Tools:
             description="Search this many seconds at the start of a continuation for the frame that best matches the source's last frame, skip the near-static onset, and cut there. 0 disables.",
         )
         JOIN_CROSSFADE_SECONDS: float = Field(
-            default=0.2, ge=0.0, le=2.0,
-            description="Short crossfade at the chosen cut point to hide residual motion-phase differences. 0 = hard cut.",
+            default=0.08, ge=0.0, le=2.0,
+            description="Blend length at the cut point. With the anchor and geometry match in place a near-hard cut (2 frames) looks cleanest; longer blends read as a brief defocus. 0 = hard cut.",
         )
         MAX_RERENDER_SECONDS: int = Field(
             default=30, ge=4, le=30,
@@ -589,9 +589,9 @@ class Tools:
                     log.info("kepler_seedance_video: stitch geometry vscale=%.3f (frame diff %.2f -> %.2f)", vs, d0, d1)
                     if abs(vs - 1.0) >= 0.0075:
                         if vs > 1:
-                            geom = f"scale={w}:{int(round(h * vs))},crop={w}:{h},"
+                            geom = f"scale={w}:{int(round(h * vs))}:flags=lanczos,crop={w}:{h},"
                         else:
-                            geom = f"scale={int(round(w / vs))}:{h},crop={w}:{h},"
+                            geom = f"scale={int(round(w / vs))}:{h}:flags=lanczos,crop={w}:{h},"
             except Exception as exc:
                 log.warning("kepler_seedance_video: geometry match skipped (%s)", exc)
 
@@ -599,9 +599,9 @@ class Tools:
             trim_a = f"atrim=start={cut},asetpts=PTS-STARTPTS," if cut > 0 else ""
             scale = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24"
             # The continuation is stretched to the source frame exactly as it was measured, then geometry-fixed.
-            scale_b = f"scale={w}:{h},{geom}setsar=1,fps=24"
+            scale_b = f"scale={w}:{h}:flags=lanczos,{geom}setsar=1,fps=24"
             xf = min(float(crossfade or 0), 2.0)
-            use_xfade = xf > 0.04 and da > xf + 0.5 and db_eff > xf + 0.5
+            use_xfade = xf > 0.03 and da > xf + 0.5 and db_eff > xf + 0.5
             if use_xfade:
                 off = round(da - xf, 3)
                 total = da + db_eff - xf
