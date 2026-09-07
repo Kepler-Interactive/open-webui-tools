@@ -3,7 +3,7 @@ title: Kepler Video Generator (Seedance)
 description: Generate short videos from a text prompt, an attached image, or several reference images/audio clips with ByteDance Seedance. Talks to BytePlus ModelArk directly (default) or Atlas Cloud.
 author: Kepler Interactive (forked from the Atlas Cloud Media Generator by binyangzhu000-sudo & Haervwe)
 author_url: https://github.com/Kepler-Interactive/open-webui-tools
-version: 0.3.0
+version: 0.4.0
 license: MIT
 required_open_webui_version: 0.9.1
 """
@@ -50,7 +50,16 @@ BYTEPLUS_BEST_MODEL = "dreamina-seedance-2-5-260628"
 # 4s@480p no audio -> 70s, 5s@720p with audio -> 124s (Seedance 2.0 Fast).
 EST_SECONDS_PER_VIDEO_SECOND = {"480p": 15.0, "720p": 20.0, "1080p": 38.0}
 EST_OVERHEAD_SECONDS = 8.0
-EST_MODEL_FACTOR = {"mini": 0.7, "fast": 1.0, "best": 1.6}
+EST_MODEL_FACTOR = {"mini": 0.7, "draft": 1.0, "hifi": 1.6}
+
+# Two user-facing tiers ("draft" / "hifi") plus a hidden "mini". Anything else the model passes is
+# mapped here; unknown values fall back to the DEFAULT_QUALITY valve.
+TIER_ALIASES = {
+    "draft": "draft", "fast": "draft", "quick": "draft", "standard": "draft", "default": "draft",
+    "hifi": "hifi", "hi-fi": "hifi", "high": "hifi", "high-fidelity": "hifi", "high_fidelity": "hifi",
+    "best": "hifi", "final": "hifi", "premium": "hifi",
+    "mini": "mini", "cheap": "mini", "cheapest": "mini",
+}
 
 log = logging.getLogger("kepler_seedance_video")
 
@@ -113,9 +122,15 @@ class Tools:
             json_schema_extra={"input": {"type": "password"}},
         )
         BYTEPLUS_BASE_URL: str = Field(default=BYTEPLUS_BASE_URL, description="ModelArk base URL (ap-southeast region).")
-        BYTEPLUS_MINI_MODEL: str = Field(default=BYTEPLUS_MINI_MODEL, description="ModelArk model for quality='mini' (cheapest).")
-        BYTEPLUS_FAST_MODEL: str = Field(default=BYTEPLUS_FAST_MODEL, description="ModelArk model for quality='fast'.")
-        BYTEPLUS_BEST_MODEL: str = Field(default=BYTEPLUS_BEST_MODEL, description="ModelArk model for quality='best'.")
+        BYTEPLUS_DRAFT_MODEL: str = Field(default=BYTEPLUS_FAST_MODEL, description="ModelArk model for the 'draft' tier.")
+        BYTEPLUS_HIFI_MODEL: str = Field(default=BYTEPLUS_BEST_MODEL, description="ModelArk model for the 'hifi' tier.")
+        BYTEPLUS_MINI_MODEL: str = Field(default=BYTEPLUS_MINI_MODEL, description="ModelArk model for the hidden 'mini' tier.")
+        DEFAULT_QUALITY: str = Field(default="draft", description="Tier used when the caller does not specify one: draft or hifi.")
+        PRICE_PER_MILLION_TOKENS_DRAFT: float = Field(
+            default=4.30, ge=0, description="USD per 1M video tokens for the draft model, used only to display an estimated cost. 0 hides it."
+        )
+        PRICE_PER_MILLION_TOKENS_HIFI: float = Field(default=10.70, ge=0, description="USD per 1M video tokens for the hifi model (display only).")
+        PRICE_PER_MILLION_TOKENS_MINI: float = Field(default=0.0, ge=0, description="USD per 1M video tokens for the mini model (display only).")
         ATLASCLOUD_API_KEY: str = Field(
             default="",
             description="Atlas Cloud API key (only used when PROVIDER=atlascloud).",
@@ -169,9 +184,17 @@ class Tools:
             "provider": provider,
             "api_key": user_key or shared_key.strip(),
             "byteplus_base_url": self.valves.BYTEPLUS_BASE_URL.rstrip("/"),
-            "byteplus_mini_model": self.valves.BYTEPLUS_MINI_MODEL,
-            "byteplus_fast_model": self.valves.BYTEPLUS_FAST_MODEL,
-            "byteplus_best_model": self.valves.BYTEPLUS_BEST_MODEL,
+            "byteplus_models": {
+                "draft": self.valves.BYTEPLUS_DRAFT_MODEL,
+                "hifi": self.valves.BYTEPLUS_HIFI_MODEL,
+                "mini": self.valves.BYTEPLUS_MINI_MODEL,
+            },
+            "prices": {
+                "draft": self.valves.PRICE_PER_MILLION_TOKENS_DRAFT,
+                "hifi": self.valves.PRICE_PER_MILLION_TOKENS_HIFI,
+                "mini": self.valves.PRICE_PER_MILLION_TOKENS_MINI,
+            },
+            "default_quality": TIER_ALIASES.get((self.valves.DEFAULT_QUALITY or "draft").strip().lower(), "draft"),
             "atlas_base_url": self.valves.ATLAS_BASE_URL.rstrip("/"),
             "atlas_fast_model": self.valves.ATLAS_FAST_MODEL,
             "atlas_best_model": self.valves.ATLAS_BEST_MODEL,
@@ -373,8 +396,8 @@ class Tools:
         first_frame: Optional[MediaRef] = None,
         ref_images: Optional[List[MediaRef]] = None,
         ref_audios: Optional[List[MediaRef]] = None,
-    ) -> str:
-        """Submit a ModelArk video generation task and return the result video URL."""
+    ) -> Dict[str, Any]:
+        """Submit a ModelArk video generation task; returns {url, tokens, task_id, seed}."""
         content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
         if first_frame:
             content.append({"type": "image_url", "image_url": {"url": first_frame.as_data_uri()}, "role": "first_frame"})
@@ -409,7 +432,13 @@ class Tools:
                     video_url = (task.get("content") or {}).get("video_url")
                     if not video_url:
                         raise VideoGenError("ModelArk task succeeded without a video_url.")
-                    return video_url
+                    usage = task.get("usage") or {}
+                    return {
+                        "url": video_url,
+                        "tokens": int(usage.get("completion_tokens") or usage.get("total_tokens") or 0),
+                        "task_id": task_id,
+                        "seed": task.get("seed"),
+                    }
                 if status in FAILED_STATUSES:
                     err = task.get("error") or {}
                     detail = err.get("message") if isinstance(err, dict) else err
@@ -443,7 +472,7 @@ class Tools:
         first_frame: Optional[MediaRef] = None,
         ref_images: Optional[List[MediaRef]] = None,
         ref_audios: Optional[List[MediaRef]] = None,
-    ) -> str:
+    ) -> Dict[str, Any]:
         headers = {"Authorization": f"Bearer {config['api_key']}"}
         base = config["atlas_base_url"]
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=config["timeout"] + 60), headers=headers) as session:
@@ -477,7 +506,7 @@ class Tools:
                         outputs = [outputs]
                     if not outputs:
                         raise VideoGenError("Atlas Cloud completed without output URLs.")
-                    return outputs[0]
+                    return {"url": outputs[0], "tokens": 0, "task_id": prediction_id, "seed": None}
                 if status in FAILED_STATUSES:
                     raise VideoGenError(f"Generation failed: {pred.get('error') or pred.get('message') or status}")
                 if status != last_status or time.monotonic() - last_emit >= 10:
@@ -487,7 +516,9 @@ class Tools:
 
     # ------------------------------------------------------------------ media out
 
-    async def _save_to_openwebui(self, video_url: str, user_id: Optional[str], filename: str) -> Optional[str]:
+    async def _save_to_openwebui(
+        self, video_url: str, user_id: Optional[str], filename: str, extra_meta: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
         """Download the MP4 and register it as an Open WebUI file. Returns the permanent relative URL."""
         if not user_id:
             return None
@@ -513,7 +544,13 @@ class Tools:
                 id=file_id,
                 filename=stored_name,
                 path=path,
-                meta={"name": filename, "content_type": content_type, "size": len(data), "source": "kepler_seedance_video"},
+                meta={
+                    "name": filename,
+                    "content_type": content_type,
+                    "size": len(data),
+                    "source": "kepler_seedance_video",
+                    **(extra_meta or {}),
+                },
             ),
         )
         return f"/api/v1/files/{file_id}/content"
@@ -525,6 +562,7 @@ class Tools:
         config: Dict[str, Any],
         summary: str,
         save_error: Optional[str] = None,
+        usage_note: str = "",
     ) -> Union[str, Tuple[HTMLResponse, str]]:
         if saved_url:
             keep_note = f"A permanent copy is saved in KeplerAI at {saved_url} (open it or attach it in later chats)."
@@ -532,18 +570,22 @@ class Tools:
             keep_note = "The provider link expires in about 24 hours, so download the clip if you want to keep it."
             if save_error:
                 keep_note += f" (Saving a copy into KeplerAI failed: {save_error}; mention this to the user.)"
-        context = f"{summary} Video URL: {provider_url}. {keep_note} Tell the user the clip is ready in one or two sentences."
+        context = (
+            f"{summary} {usage_note} Video URL: {provider_url}. {keep_note} "
+            "Tell the user the clip is ready in one or two sentences and include the token usage line."
+        )
         if config["return_html_embed"]:
             links = f'<a href="{provider_url}" target="_blank" rel="noopener">Download (provider link, ~24h)</a>'
             if saved_url:
                 links = f'<a href="{saved_url}" target="_blank" rel="noopener">Download (saved in KeplerAI)</a> &middot; ' + links
+            usage_html = f'<span style="opacity:.75"> &middot; {usage_note}</span>' if usage_note else ""
             html = (
                 f'<video controls autoplay muted playsinline src="{provider_url}" width="960" '
                 f'style="max-width:100%;border-radius:8px"></video>'
-                f'<p style="font-family:sans-serif;font-size:12px">{links}</p>'
+                f'<p style="font-family:sans-serif;font-size:12px">{links}{usage_html}</p>'
             )
             return HTMLResponse(content=html, headers={"content-disposition": "inline"}), context
-        out = f"{summary}\n\n- [Provider link (expires ~24h)]({provider_url})"
+        out = f"{summary} {usage_note}\n\n- [Provider link (expires ~24h)]({provider_url})"
         if saved_url:
             out += f"\n- [Saved in KeplerAI]({saved_url})"
         return out
@@ -568,22 +610,17 @@ class Tools:
             which = "BYTEPLUS_API_KEY" if config["provider"] == "byteplus" else "ATLASCLOUD_API_KEY"
             return f"Video generation is not configured yet: an admin must set {which} in the tool's Valves."
 
-        # Quality tier -> model. Multi-reference mode needs Seedance 2.5, so it always runs on 'best'.
-        tier = str(quality).lower().strip()
-        tier = tier if tier in ("mini", "fast", "best") else "fast"
+        # Quality tier -> model. Multi-reference mode needs Seedance 2.5, so it always runs on 'hifi'.
+        tier = TIER_ALIASES.get(str(quality or "").lower().strip(), config["default_quality"])
         if mode == "reference":
-            tier = "best"
+            tier = "hifi"
         if config["provider"] == "byteplus":
             # ModelArk uses one model id for text / first-frame / reference inputs.
-            model = {
-                "mini": config["byteplus_mini_model"],
-                "fast": config["byteplus_fast_model"],
-                "best": config["byteplus_best_model"],
-            }[tier]
+            model = config["byteplus_models"][tier]
             runner = self._byteplus_generate
         else:
             model = {
-                "text": config["atlas_best_model"] if tier == "best" else config["atlas_fast_model"],
+                "text": config["atlas_best_model"] if tier == "hifi" else config["atlas_fast_model"],
                 "image": config["atlas_image_to_video_model"],
                 "reference": config["atlas_reference_model"],
             }[mode]
@@ -598,18 +635,50 @@ class Tools:
             emitter, f"Submitting to {model} ({config['provider']}, ~{int(config['est_total'])}s estimated)", done=False
         )
         try:
-            provider_url = await runner(config, emitter, label, model, prompt, params, first_frame, ref_images, ref_audios)
+            result = await runner(config, emitter, label, model, prompt, params, first_frame, ref_images, ref_audios)
         except (VideoGenError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
             log.warning("kepler_seedance_video: generation failed: %s", exc)
             await self._emit_status(emitter, f"Video generation error: {exc}", done=True)
             return f"Video generation failed: {exc}"
+
+        provider_url = result["url"]
+        tokens = int(result.get("tokens") or 0)
+        usage_note = ""
+        if tokens:
+            price = float(config["prices"].get(tier) or 0)
+            usage_note = f"{tokens:,} video tokens"
+            if price > 0:
+                usage_note += f" (≈ ${tokens / 1_000_000 * price:.2f})"
+        log.info(
+            "kepler_seedance_video: %s tier=%s model=%s duration=%ss res=%s tokens=%s task=%s user=%s",
+            config["provider"], tier, model, params["duration"], params["resolution"], tokens,
+            result.get("task_id"), (user or {}).get("id"),
+        )
 
         saved_url, save_error = None, None
         if config["save_to_openwebui"]:
             await self._emit_status(emitter, "Saving video to KeplerAI storage", done=False)
             try:
                 saved_url = await self._save_to_openwebui(
-                    provider_url, (user or {}).get("id"), f"seedance-{time.strftime('%Y%m%d-%H%M%S')}.mp4"
+                    provider_url,
+                    (user or {}).get("id"),
+                    f"seedance-{time.strftime('%Y%m%d-%H%M%S')}.mp4",
+                    {
+                        "seedance": {
+                            "provider": config["provider"],
+                            "model": model,
+                            "tier": tier,
+                            "task_id": result.get("task_id"),
+                            "seed": result.get("seed"),
+                            "tokens": tokens,
+                            "prompt": prompt,
+                            "duration": params["duration"],
+                            "resolution": params["resolution"],
+                            "ratio": params["ratio"],
+                            "provider_url": provider_url,
+                            "provider_url_expires_at": int(time.time()) + 24 * 3600,
+                        }
+                    },
                 )
                 if not saved_url:
                     save_error = "storage layer unavailable or no user id"
@@ -619,7 +688,7 @@ class Tools:
 
         await self._emit_status(emitter, f"{label}: done", done=True)
         summary = f"Generated a {params['duration']}s {params['resolution']} clip with {model} ({tier} tier) via {config['provider']}."
-        return self._render(provider_url, saved_url, config, summary, save_error)
+        return self._render(provider_url, saved_url, config, summary, save_error, usage_note)
 
     async def _prepare_refs(self, emitter: EventEmitter, refs: List[str], kind: str) -> List[MediaRef]:
         if refs:
@@ -635,7 +704,7 @@ class Tools:
         resolution: str = "720p",
         ratio: str = "16:9",
         generate_audio: bool = True,
-        quality: str = "fast",
+        quality: str = "",
         __event_emitter__: EventEmitter = None,
         __user__: Optional[Dict[str, Any]] = None,
     ) -> Union[str, Tuple[HTMLResponse, str]]:
@@ -652,7 +721,7 @@ class Tools:
         :param resolution: 480p, 720p or 1080p. Default 720p.
         :param ratio: Aspect ratio: 16:9 (default), 9:16 for social/vertical, 1:1, 4:3, 3:4 or 21:9.
         :param generate_audio: Whether to generate synchronised sound, music and speech. Default true.
-        :param quality: "fast" (default, Seedance 2.0 Fast, good for iteration), "mini" (Seedance 2.0 Mini, cheapest and quickest, rougher look; use when the user says draft, rough, cheap or quick test) or "best" (Seedance 2.5, highest fidelity, several times the cost; only when the user asks for high quality or a final version).
+        :param quality: Leave empty to use the configured default. "draft" = Seedance 2.0 Fast (quick, cheap iteration). "hifi" = Seedance 2.5 (highest fidelity, several times the cost) - only when the user explicitly asks for high fidelity, high quality or a final version.
         """
         config = self._resolve_config(__user__)
         params = {
@@ -670,7 +739,7 @@ class Tools:
         duration: int = 5,
         resolution: str = "720p",
         generate_audio: bool = True,
-        quality: str = "fast",
+        quality: str = "",
         __event_emitter__: EventEmitter = None,
         __user__: Optional[Dict[str, Any]] = None,
         __messages__: Optional[List[Dict[str, Any]]] = None,
@@ -686,7 +755,7 @@ class Tools:
         :param duration: Clip length in seconds (4-10). Default 5.
         :param resolution: 480p, 720p or 1080p. Default 720p.
         :param generate_audio: Whether to generate synchronised sound. Default true.
-        :param quality: "fast" (default), "mini" (cheapest draft) or "best" (Seedance 2.5, highest fidelity).
+        :param quality: Leave empty for the configured default. "draft" (quick, cheap) or "hifi" (Seedance 2.5, highest fidelity, only when explicitly asked).
         """
         config = self._resolve_config(__user__)
         target = image_url or next(iter(self._collect_media(__messages__, __files__, "image")), None)
