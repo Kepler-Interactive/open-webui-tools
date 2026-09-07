@@ -3,7 +3,7 @@ title: Kepler Video Generator (Seedance)
 description: Generate, extend and edit short videos with ByteDance Seedance from text, attached images, reference images/audio/video. Talks to BytePlus ModelArk directly (default) or Atlas Cloud.
 author: Kepler Interactive (forked from the Atlas Cloud Media Generator by binyangzhu000-sudo & Haervwe)
 author_url: https://github.com/Kepler-Interactive/open-webui-tools
-version: 0.10.0
+version: 0.10.1
 license: MIT
 required_open_webui_version: 0.9.1
 """
@@ -1089,7 +1089,10 @@ class Tools:
             )
             summary = (
                 f"Extended the clip to {total_duration}s total (original + {params['duration']}s continuation). {player_note} "
-                f"{params['resolution']}, {model} ({tier} tier) via {config['provider']}."
+                f"{params['resolution']}, {model} ({tier} tier) via {config['provider']}. "
+                "Note for the user: a stitched extension always has a soft seam because the provider cannot continue "
+                "motion frame-exactly; for a seamless final, they can ask for a hifi version, which re-renders the whole "
+                "clip as one continuous take."
             )
         else:
             verb = {
