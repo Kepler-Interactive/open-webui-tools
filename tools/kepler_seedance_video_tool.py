@@ -1,21 +1,24 @@
 """
 title: Kepler Video Generator (Seedance)
-description: Generate short videos from a text prompt, from an attached image, or from several reference images/audio clips using ByteDance Seedance models via the Atlas Cloud API.
+description: Generate short videos from a text prompt, an attached image, or several reference images/audio clips with ByteDance Seedance. Talks to BytePlus ModelArk directly (default) or Atlas Cloud.
 author: Kepler Interactive (forked from the Atlas Cloud Media Generator by binyangzhu000-sudo & Haervwe)
 author_url: https://github.com/Kepler-Interactive/open-webui-tools
-version: 0.1.0
+version: 0.2.0
 license: MIT
 required_open_webui_version: 0.9.1
 """
 
 # Kepler changes versus the upstream atlascloud_media_tool.py:
+#   * PROVIDER valve: "byteplus" (ByteDance's own ModelArk API, default) or
+#     "atlascloud" (reseller). Same three tool functions either way.
+#   * Finished videos are downloaded into Open WebUI file storage (SAVE_TO_OPENWEBUI)
+#     because ModelArk result URLs expire after 24 hours.
 #   * Video only. Image generation/editing removed so the model has fewer,
 #     clearer tools to choose from (KeplerAI already has image generation).
 #   * Local filesystem paths are NOT accepted as media inputs any more. The
-#     upstream tool would read any path the LLM passed and upload it to Atlas
-#     Cloud, which is an exfiltration risk on a shared server.
-#   * Open WebUI file attachments are resolved through the Files/Storage
-#     layer instead of an unauthenticated HTTP fetch of /api/v1/files/...
+#     upstream tool would read any path the LLM passed and upload it, which is
+#     an exfiltration risk on a shared server.
+#   * Open WebUI attachments are resolved through the Files/Storage layer.
 #   * "fast" / "best" quality tiers, duration and resolution caps (cost control),
 #     and a reference-to-video function that mirrors Dreamina's multi-reference
 #     workflow (@Image1 / @Audio1 prompt syntax, up to N references).
@@ -23,8 +26,10 @@ required_open_webui_version: 0.9.1
 
 import asyncio
 import base64
+import io
 import re
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -32,17 +37,24 @@ import aiohttp
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-VIDEO_ENDPOINT = "/model/generateVideo"
-UPLOAD_ENDPOINT = "/model/uploadMedia"
-PREDICTION_ENDPOINT = "/model/prediction"
+# --- BytePlus ModelArk (ByteDance first-party, international) ---------------
+BYTEPLUS_BASE_URL = "https://ark.ap-southeast.bytepluses.com/api/v3"
+BYTEPLUS_TASKS_PATH = "/contents/generations/tasks"
+BYTEPLUS_FAST_MODEL = "dreamina-seedance-2-0-fast-260128"
+BYTEPLUS_BEST_MODEL = "dreamina-seedance-2-5-260628"
 
-DEFAULT_FAST_MODEL = "bytedance/seedance-2.0-fast/text-to-video"
-DEFAULT_BEST_MODEL = "bytedance/seedance-2.5/text-to-video"
-DEFAULT_IMAGE_TO_VIDEO_MODEL = "bytedance/seedance-2.5/image-to-video"
-DEFAULT_REFERENCE_MODEL = "bytedance/seedance-2.5/reference-to-video"
+# --- Atlas Cloud (reseller) --------------------------------------------------
+ATLAS_BASE_URL = "https://api.atlascloud.ai/api/v1"
+ATLAS_VIDEO_ENDPOINT = "/model/generateVideo"
+ATLAS_UPLOAD_ENDPOINT = "/model/uploadMedia"
+ATLAS_PREDICTION_ENDPOINT = "/model/prediction"
+ATLAS_FAST_MODEL = "bytedance/seedance-2.0-fast/text-to-video"
+ATLAS_BEST_MODEL = "bytedance/seedance-2.5/text-to-video"
+ATLAS_IMAGE_TO_VIDEO_MODEL = "bytedance/seedance-2.5/image-to-video"
+ATLAS_REFERENCE_MODEL = "bytedance/seedance-2.5/reference-to-video"
 
 COMPLETED_STATUSES = frozenset({"completed", "succeeded", "success"})
-FAILED_STATUSES = frozenset({"failed", "error", "cancelled", "canceled", "timeout"})
+FAILED_STATUSES = frozenset({"failed", "error", "cancelled", "canceled", "timeout", "expired"})
 
 VALID_RATIOS = ("16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive")
 
@@ -52,50 +64,59 @@ UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 EventEmitter = Optional[Callable[[dict[str, Any]], Awaitable[None]]]
 
 
-class AtlasCloudError(RuntimeError):
-    """Raised when Atlas Cloud rejects or fails a generation request."""
+class VideoGenError(RuntimeError):
+    """Raised when the provider rejects or fails a generation request."""
+
+
+class MediaRef:
+    """A resolved media input: either raw bytes (+mime) or a public URL."""
+
+    def __init__(self, url: Optional[str] = None, data: Optional[bytes] = None, mime: str = "", name: str = ""):
+        self.url = url
+        self.data = data
+        self.mime = mime
+        self.name = name
+
+    def as_data_uri(self) -> str:
+        if self.url:
+            return self.url
+        return f"data:{self.mime};base64,{base64.b64encode(self.data or b'').decode()}"
 
 
 class Tools:
     class UserValves(BaseModel):
-        ATLASCLOUD_API_KEY: Optional[str] = Field(
+        API_KEY: Optional[str] = Field(
             default=None,
-            description="Optional personal Atlas Cloud API key (overrides the shared key).",
+            description="Optional personal API key for the active provider (overrides the shared key).",
             json_schema_extra={"input": {"type": "password"}},
         )
 
     class Valves(BaseModel):
-        ATLASCLOUD_API_KEY: str = Field(
+        PROVIDER: str = Field(
+            default="byteplus",
+            description="'byteplus' = ByteDance's ModelArk API directly (default). 'atlascloud' = Atlas Cloud reseller.",
+        )
+        BYTEPLUS_API_KEY: str = Field(
             default="",
-            description="Shared Atlas Cloud API key (console.atlascloud.ai).",
+            description="BytePlus ModelArk API key (console.byteplus.com > ModelArk > API keys).",
             json_schema_extra={"input": {"type": "password"}},
         )
-        API_BASE_URL: str = Field(
-            default="https://api.atlascloud.ai/api/v1",
-            description="Atlas Cloud Media API base URL.",
+        BYTEPLUS_BASE_URL: str = Field(default=BYTEPLUS_BASE_URL, description="ModelArk base URL (ap-southeast region).")
+        BYTEPLUS_FAST_MODEL: str = Field(default=BYTEPLUS_FAST_MODEL, description="ModelArk model for quality='fast'.")
+        BYTEPLUS_BEST_MODEL: str = Field(default=BYTEPLUS_BEST_MODEL, description="ModelArk model for quality='best'.")
+        ATLASCLOUD_API_KEY: str = Field(
+            default="",
+            description="Atlas Cloud API key (only used when PROVIDER=atlascloud).",
+            json_schema_extra={"input": {"type": "password"}},
         )
-        FAST_MODEL: str = Field(
-            default=DEFAULT_FAST_MODEL,
-            description="Text-to-video model for quality='fast' (cheap, ~1-2 min).",
-        )
-        BEST_MODEL: str = Field(
-            default=DEFAULT_BEST_MODEL,
-            description="Text-to-video model for quality='best' (Seedance 2.5, ~6x the cost).",
-        )
-        IMAGE_TO_VIDEO_MODEL: str = Field(
-            default=DEFAULT_IMAGE_TO_VIDEO_MODEL,
-            description="Model used when an attached image is the first frame.",
-        )
-        REFERENCE_MODEL: str = Field(
-            default=DEFAULT_REFERENCE_MODEL,
-            description="Model used for multi-reference (images/audio) generation.",
-        )
+        ATLAS_BASE_URL: str = Field(default=ATLAS_BASE_URL)
+        ATLAS_FAST_MODEL: str = Field(default=ATLAS_FAST_MODEL)
+        ATLAS_BEST_MODEL: str = Field(default=ATLAS_BEST_MODEL)
+        ATLAS_IMAGE_TO_VIDEO_MODEL: str = Field(default=ATLAS_IMAGE_TO_VIDEO_MODEL)
+        ATLAS_REFERENCE_MODEL: str = Field(default=ATLAS_REFERENCE_MODEL)
         DEFAULT_DURATION_SECONDS: int = Field(default=5, ge=4, le=30)
         MAX_DURATION_SECONDS: int = Field(
-            default=10,
-            ge=4,
-            le=30,
-            description="Hard cap on clip length to keep costs predictable.",
+            default=10, ge=4, le=30, description="Hard cap on clip length to keep costs predictable."
         )
         ALLOWED_RESOLUTIONS: str = Field(
             default="480p,720p,1080p",
@@ -104,12 +125,13 @@ class Tools:
         DEFAULT_RESOLUTION: str = Field(default="720p")
         MAX_REFERENCE_IMAGES: int = Field(default=9, ge=1, le=30)
         MAX_REFERENCE_AUDIO: int = Field(default=3, ge=0, le=10)
-        POLL_INTERVAL_SECONDS: float = Field(default=3.0, ge=0.5)
+        POLL_INTERVAL_SECONDS: float = Field(default=5.0, ge=0.5)
         GENERATION_TIMEOUT_SECONDS: float = Field(default=600.0, ge=30.0)
-        RETURN_HTML_EMBED: bool = Field(
+        SAVE_TO_OPENWEBUI: bool = Field(
             default=True,
-            description="Render an inline video player in the chat on completion.",
+            description="Download the finished MP4 into Open WebUI file storage (provider links expire after ~24h).",
         )
+        RETURN_HTML_EMBED: bool = Field(default=True, description="Render an inline video player in the chat.")
 
     def __init__(self) -> None:
         self.valves = self.Valves()
@@ -122,18 +144,26 @@ class Tools:
             v = __user__["valves"]
             try:
                 uv = v if isinstance(v, Tools.UserValves) else Tools.UserValves(**(v if isinstance(v, dict) else v.__dict__))
-                user_key = (uv.ATLASCLOUD_API_KEY or "").strip()
+                user_key = (uv.API_KEY or "").strip()
             except Exception:
                 user_key = ""
 
+        provider = (self.valves.PROVIDER or "byteplus").strip().lower()
+        if provider not in ("byteplus", "atlascloud"):
+            provider = "byteplus"
+        shared_key = self.valves.BYTEPLUS_API_KEY if provider == "byteplus" else self.valves.ATLASCLOUD_API_KEY
         allowed = {r.strip().lower() for r in self.valves.ALLOWED_RESOLUTIONS.split(",") if r.strip()}
         return {
-            "api_key": user_key or self.valves.ATLASCLOUD_API_KEY.strip(),
-            "base_url": self.valves.API_BASE_URL.rstrip("/"),
-            "fast_model": self.valves.FAST_MODEL,
-            "best_model": self.valves.BEST_MODEL,
-            "image_to_video_model": self.valves.IMAGE_TO_VIDEO_MODEL,
-            "reference_model": self.valves.REFERENCE_MODEL,
+            "provider": provider,
+            "api_key": user_key or shared_key.strip(),
+            "byteplus_base_url": self.valves.BYTEPLUS_BASE_URL.rstrip("/"),
+            "byteplus_fast_model": self.valves.BYTEPLUS_FAST_MODEL,
+            "byteplus_best_model": self.valves.BYTEPLUS_BEST_MODEL,
+            "atlas_base_url": self.valves.ATLAS_BASE_URL.rstrip("/"),
+            "atlas_fast_model": self.valves.ATLAS_FAST_MODEL,
+            "atlas_best_model": self.valves.ATLAS_BEST_MODEL,
+            "atlas_image_to_video_model": self.valves.ATLAS_IMAGE_TO_VIDEO_MODEL,
+            "atlas_reference_model": self.valves.ATLAS_REFERENCE_MODEL,
             "default_duration": self.valves.DEFAULT_DURATION_SECONDS,
             "max_duration": self.valves.MAX_DURATION_SECONDS,
             "allowed_resolutions": allowed,
@@ -142,6 +172,7 @@ class Tools:
             "max_ref_audio": self.valves.MAX_REFERENCE_AUDIO,
             "poll_interval": self.valves.POLL_INTERVAL_SECONDS,
             "timeout": self.valves.GENERATION_TIMEOUT_SECONDS,
+            "save_to_openwebui": self.valves.SAVE_TO_OPENWEBUI,
             "return_html_embed": self.valves.RETURN_HTML_EMBED,
         }
 
@@ -151,9 +182,7 @@ class Tools:
             d = int(duration)
         except (TypeError, ValueError):
             d = config["default_duration"]
-        if d < 4:
-            d = 4
-        return min(d, config["max_duration"])
+        return min(max(d, 4), config["max_duration"])
 
     @staticmethod
     def _clamp_resolution(resolution: Any, config: Dict[str, Any]) -> str:
@@ -179,45 +208,16 @@ class Tools:
             payload = await response.json()
         except (aiohttp.ContentTypeError, ValueError) as exc:
             body = (await response.text()).strip()
-            raise AtlasCloudError(
-                f"Atlas Cloud returned a non-JSON response ({response.status}): {body[:300]}"
-            ) from exc
+            raise VideoGenError(f"Provider returned a non-JSON response ({response.status}): {body[:300]}") from exc
         if not isinstance(payload, dict):
-            raise AtlasCloudError("Atlas Cloud returned an invalid JSON payload.")
+            raise VideoGenError("Provider returned an invalid JSON payload.")
         if response.status >= 400:
-            detail = payload.get("message") or payload.get("error") or payload
-            raise AtlasCloudError(f"Atlas Cloud request failed ({response.status}): {detail}")
+            err = payload.get("error")
+            detail = (err.get("message") if isinstance(err, dict) else err) or payload.get("message") or payload
+            raise VideoGenError(f"Provider request failed ({response.status}): {detail}")
         return payload
 
-    @staticmethod
-    def _data(payload: dict[str, Any]) -> dict[str, Any]:
-        code = payload.get("code")
-        if code not in (None, 0, 200):
-            detail = payload.get("message") or payload.get("error") or f"code {code}"
-            raise AtlasCloudError(f"Atlas Cloud request failed: {detail}")
-        data = payload.get("data", payload)
-        if not isinstance(data, dict):
-            raise AtlasCloudError("Atlas Cloud returned an invalid response payload.")
-        return data
-
-    async def _upload_media(
-        self,
-        session: aiohttp.ClientSession,
-        base_url: str,
-        file_bytes: bytes,
-        filename: str,
-        content_type: str,
-    ) -> str:
-        data = aiohttp.FormData()
-        data.add_field("file", file_bytes, filename=filename, content_type=content_type)
-        async with session.post(f"{base_url}{UPLOAD_ENDPOINT}", data=data) as resp:
-            res = self._data(await self._json_response(resp))
-            url = res.get("url") or res.get("file_url")
-            if not url or not isinstance(url, str):
-                raise AtlasCloudError("Atlas Cloud uploadMedia did not return a valid URL.")
-            return url
-
-    # ------------------------------------------------------------------ media
+    # ------------------------------------------------------------------ media in
 
     @staticmethod
     async def _read_owui_file(file_id: str) -> Tuple[bytes, str, str]:
@@ -225,28 +225,22 @@ class Tools:
         try:
             from open_webui.models.files import Files
             from open_webui.storage.provider import Storage
-        except Exception as exc:  # pragma: no cover - depends on host app
-            raise AtlasCloudError(f"Cannot access Open WebUI file storage: {exc}") from exc
+        except Exception as exc:  # pragma: no cover
+            raise VideoGenError(f"Cannot access Open WebUI file storage: {exc}") from exc
 
         file = await Files.get_file_by_id(file_id)
         if not file or not getattr(file, "path", None):
-            raise AtlasCloudError(f"Attached file {file_id} was not found in Open WebUI storage.")
-
-        local_path = Storage.get_file(file.path)
+            raise VideoGenError(f"Attached file {file_id} was not found in Open WebUI storage.")
+        local_path = await asyncio.to_thread(Storage.get_file, file.path)
         with open(local_path, "rb") as fh:
             raw = fh.read()
-
         meta = file.meta or {}
-        content_type = meta.get("content_type") or "application/octet-stream"
-        filename = meta.get("name") or file.filename or f"{file_id}"
-        return raw, filename, content_type
+        return raw, (meta.get("name") or file.filename or file_id), (meta.get("content_type") or "application/octet-stream")
 
-    async def _ensure_atlas_media_url(
-        self, session: aiohttp.ClientSession, base_url: str, media_input: str
-    ) -> str:
-        """Turn a data URI, Open WebUI file reference, or public URL into an Atlas-hosted URL."""
+    async def _resolve_media(self, media_input: str) -> MediaRef:
+        """Turn a data URI, Open WebUI file reference, or public URL into a MediaRef."""
         if not media_input or not isinstance(media_input, str):
-            raise AtlasCloudError("No valid media input provided.")
+            raise VideoGenError("No valid media input provided.")
         s = media_input.strip()
 
         if s.startswith("data:"):
@@ -259,21 +253,17 @@ class Tools:
             if "audio/mp3" in header:
                 mime = "audio/mpeg"
             ext = {"image/jpeg": "jpg", "audio/mpeg": "mp3"}.get(mime, mime.split("/")[-1])
-            raw = base64.b64decode(data_str)
-            return await self._upload_media(session, base_url, raw, f"input.{ext}", mime)
+            return MediaRef(data=base64.b64decode(data_str), mime=mime, name=f"input.{ext}")
 
         m = OWUI_FILE_ID_RE.search(s)
         if m or UUID_RE.match(s):
-            file_id = m.group(1) if m else s
-            raw, filename, content_type = await self._read_owui_file(file_id)
-            return await self._upload_media(session, base_url, raw, filename, content_type)
+            raw, name, mime = await self._read_owui_file(m.group(1) if m else s)
+            return MediaRef(data=raw, mime=mime, name=name)
 
         if s.startswith("https://") or s.startswith("http://"):
-            return s
+            return MediaRef(url=s)
 
-        raise AtlasCloudError(
-            "Unsupported media reference. Attach the file to the chat or give a public https:// URL."
-        )
+        raise VideoGenError("Unsupported media reference. Attach the file to the chat or give a public https:// URL.")
 
     def _collect_media(
         self,
@@ -281,20 +271,22 @@ class Tools:
         files: Optional[List[Dict[str, Any]]],
         media_type: str,
     ) -> List[str]:
-        """Collect image or audio references from the most recent message that has any, plus __files__."""
+        """Collect image or audio references from __files__ and the latest user message that has any."""
         found: List[str] = []
 
-        for f in files or []:
-            if not isinstance(f, dict):
-                continue
+        def match(f: Dict[str, Any]) -> Optional[str]:
             ctype = ((f.get("file") or {}).get("meta") or {}).get("content_type") or ""
             ftype = f.get("type") or ""
-            is_image = ftype == "image" or ctype.startswith("image/")
-            is_audio = ctype.startswith("audio/")
-            if (media_type == "image" and is_image) or (media_type == "audio" and is_audio):
-                ref = f.get("url") or f.get("id")
-                if ref:
-                    found.append(ref)
+            ok = (media_type == "image" and (ftype == "image" or ctype.startswith("image/"))) or (
+                media_type == "audio" and ctype.startswith("audio/")
+            )
+            return (f.get("url") or f.get("id")) if ok else None
+
+        for f in files or []:
+            if isinstance(f, dict):
+                u = match(f)
+                if u:
+                    found.append(u)
 
         for message in reversed(messages or []):
             if message.get("role") != "user":
@@ -317,22 +309,19 @@ class Tools:
                         if u:
                             hits.append(u)
             elif isinstance(content, str) and media_type == "image":
-                hits.extend(re.findall(r"!\[[^\]]*\]\((https?://[^\s\)]+|data:image/[^\s\)]+|/api/v1/files/[^\s\)]+)\)", content))
+                hits.extend(
+                    re.findall(r"!\[[^\]]*\]\((https?://[^\s\)]+|data:image/[^\s\)]+|/api/v1/files/[^\s\)]+)\)", content)
+                )
             for f in message.get("files") or []:
                 if isinstance(f, dict):
-                    ctype = ((f.get("file") or {}).get("meta") or {}).get("content_type") or ""
-                    if (media_type == "image" and (f.get("type") == "image" or ctype.startswith("image/"))) or (
-                        media_type == "audio" and ctype.startswith("audio/")
-                    ):
-                        u = f.get("url") or f.get("id")
-                        if u:
-                            hits.append(u)
+                    u = match(f)
+                    if u:
+                        hits.append(u)
             if hits:
                 found.extend(hits)
                 break
 
-        # de-duplicate, keep order
-        seen = set()
+        seen: set = set()
         out: List[str] = []
         for u in found:
             if u not in seen:
@@ -340,93 +329,247 @@ class Tools:
                 out.append(u)
         return out
 
-    # ------------------------------------------------------------------ core
+    # ------------------------------------------------------------------ providers
 
-    async def _submit_and_wait(
+    async def _byteplus_generate(
         self,
-        payload: dict[str, Any],
         config: Dict[str, Any],
         emitter: EventEmitter,
         label: str,
-    ) -> list[str]:
-        if not config["api_key"]:
-            raise AtlasCloudError(
-                "Atlas Cloud API key is not configured. An admin must set ATLASCLOUD_API_KEY in the tool's Valves."
-            )
-        headers = {"Authorization": f"Bearer {config['api_key']}", "Content-Type": "application/json"}
-        timeout = aiohttp.ClientTimeout(total=config["timeout"] + 30)
+        model: str,
+        prompt: str,
+        params: Dict[str, Any],
+        first_frame: Optional[MediaRef] = None,
+        ref_images: Optional[List[MediaRef]] = None,
+        ref_audios: Optional[List[MediaRef]] = None,
+    ) -> str:
+        """Submit a ModelArk video generation task and return the result video URL."""
+        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+        if first_frame:
+            content.append({"type": "image_url", "image_url": {"url": first_frame.as_data_uri()}, "role": "first_frame"})
+        for ref in ref_images or []:
+            content.append({"type": "image_url", "image_url": {"url": ref.as_data_uri()}, "role": "reference_image"})
+        for ref in ref_audios or []:
+            content.append({"type": "audio_url", "audio_url": {"url": ref.as_data_uri()}, "role": "reference_audio"})
 
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.post(f"{config['base_url']}{VIDEO_ENDPOINT}", json=payload) as response:
-                submit = self._data(await self._json_response(response))
-            prediction_id = submit.get("id") or submit.get("request_id")
-            if not prediction_id:
-                raise AtlasCloudError("Atlas Cloud did not return a prediction ID.")
+        payload: Dict[str, Any] = {"model": model, "content": content, "watermark": False, **params}
+        # ModelArk only understands 'adaptive' when there is an image to adapt to.
+        if payload.get("ratio") == "adaptive" and not (first_frame or ref_images):
+            payload["ratio"] = "16:9"
+
+        headers = {"Authorization": f"Bearer {config['api_key']}", "Content-Type": "application/json"}
+        base = config["byteplus_base_url"]
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=config["timeout"] + 60), headers=headers) as session:
+            async with session.post(f"{base}{BYTEPLUS_TASKS_PATH}", json=payload) as response:
+                created = await self._json_response(response)
+            task_id = created.get("id")
+            if not task_id:
+                raise VideoGenError(f"ModelArk did not return a task id: {created}")
 
             started = time.monotonic()
             deadline = started + config["timeout"]
-            last_emit = 0.0
-            last_status: Optional[str] = None
+            last_status, last_emit = None, 0.0
             while time.monotonic() < deadline:
-                async with session.get(f"{config['base_url']}{PREDICTION_ENDPOINT}/{prediction_id}") as response:
-                    prediction = self._data(await self._json_response(response))
-                status = str(prediction.get("status", "")).lower()
-
+                await asyncio.sleep(config["poll_interval"])
+                async with session.get(f"{base}{BYTEPLUS_TASKS_PATH}/{task_id}") as response:
+                    task = await self._json_response(response)
+                status = str(task.get("status", "")).lower()
                 if status in COMPLETED_STATUSES:
-                    outputs = prediction.get("outputs") or prediction.get("output") or []
-                    if isinstance(outputs, str):
-                        outputs = [outputs]
-                    if not isinstance(outputs, list) or not all(isinstance(o, str) for o in outputs) or not outputs:
-                        raise AtlasCloudError("Atlas Cloud completed without valid output URLs.")
-                    return outputs
+                    video_url = (task.get("content") or {}).get("video_url")
+                    if not video_url:
+                        raise VideoGenError("ModelArk task succeeded without a video_url.")
+                    return video_url
                 if status in FAILED_STATUSES:
-                    detail = prediction.get("error") or prediction.get("message") or status
-                    raise AtlasCloudError(f"Generation failed: {detail}")
-
+                    err = task.get("error") or {}
+                    detail = err.get("message") if isinstance(err, dict) else err
+                    raise VideoGenError(f"Generation failed: {detail or status}")
                 elapsed = int(time.monotonic() - started)
                 if status != last_status or time.monotonic() - last_emit >= 15:
-                    last_status = status
-                    last_emit = time.monotonic()
-                    await self._emit_status(
-                        emitter, f"{label}: {status or 'processing'} ({elapsed}s elapsed)", done=False
-                    )
-                await asyncio.sleep(config["poll_interval"])
+                    last_status, last_emit = status, time.monotonic()
+                    await self._emit_status(emitter, f"{label}: {status or 'queued'} ({elapsed}s elapsed)", done=False)
+        raise VideoGenError("Generation timed out. Try a shorter clip or lower resolution.")
 
-        raise AtlasCloudError("Generation timed out. Try a shorter clip or lower resolution.")
+    async def _atlas_upload(self, session: aiohttp.ClientSession, base: str, ref: MediaRef) -> str:
+        if ref.url:
+            return ref.url
+        data = aiohttp.FormData()
+        data.add_field("file", ref.data, filename=ref.name or "input", content_type=ref.mime or "application/octet-stream")
+        async with session.post(f"{base}{ATLAS_UPLOAD_ENDPOINT}", data=data) as resp:
+            payload = await self._json_response(resp)
+            res = payload.get("data", payload)
+            url = res.get("url") or res.get("file_url") if isinstance(res, dict) else None
+            if not url:
+                raise VideoGenError("Atlas Cloud uploadMedia did not return a URL.")
+            return url
 
-    def _render_result(
-        self, outputs: List[str], config: Dict[str, Any], summary: str
-    ) -> Union[str, Tuple[HTMLResponse, str]]:
-        url = outputs[0]
-        context = (
-            f"{summary} Video URL: {url}\n"
-            "Tell the user the clip is ready and remind them the link is hosted by Atlas Cloud, "
-            "so they should download it if they want to keep it."
-        )
-        if config["return_html_embed"]:
-            html = (
-                f'<video controls autoplay muted playsinline src="{url}" width="960" '
-                f'style="max-width:100%;border-radius:8px"></video>'
-                f'<p style="font-family:sans-serif;font-size:12px"><a href="{url}" target="_blank" rel="noopener">Download video</a></p>'
-            )
-            return HTMLResponse(content=html, headers={"content-disposition": "inline"}), context
-        return f"{summary}\n\n" + "\n".join(f"- [Download video]({u})" for u in outputs)
-
-    async def _run(
+    async def _atlas_generate(
         self,
-        payload: Dict[str, Any],
         config: Dict[str, Any],
         emitter: EventEmitter,
         label: str,
-        summary: str,
-    ) -> Union[str, Tuple[HTMLResponse, str]]:
+        model: str,
+        prompt: str,
+        params: Dict[str, Any],
+        first_frame: Optional[MediaRef] = None,
+        ref_images: Optional[List[MediaRef]] = None,
+        ref_audios: Optional[List[MediaRef]] = None,
+    ) -> str:
+        headers = {"Authorization": f"Bearer {config['api_key']}"}
+        base = config["atlas_base_url"]
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=config["timeout"] + 60), headers=headers) as session:
+            payload: Dict[str, Any] = {"model": model, "prompt": prompt, **params}
+            if first_frame:
+                payload["image_url"] = await self._atlas_upload(session, base, first_frame)
+            if ref_images:
+                payload["reference_images"] = [await self._atlas_upload(session, base, r) for r in ref_images]
+            if ref_audios:
+                payload["reference_audios"] = [await self._atlas_upload(session, base, r) for r in ref_audios]
+
+            async with session.post(f"{base}{ATLAS_VIDEO_ENDPOINT}", json=payload) as response:
+                created = await self._json_response(response)
+            data = created.get("data", created)
+            prediction_id = data.get("id") or data.get("request_id") if isinstance(data, dict) else None
+            if not prediction_id:
+                raise VideoGenError("Atlas Cloud did not return a prediction id.")
+
+            started = time.monotonic()
+            deadline = started + config["timeout"]
+            last_status, last_emit = None, 0.0
+            while time.monotonic() < deadline:
+                await asyncio.sleep(config["poll_interval"])
+                async with session.get(f"{base}{ATLAS_PREDICTION_ENDPOINT}/{prediction_id}") as response:
+                    pred = await self._json_response(response)
+                pred = pred.get("data", pred)
+                status = str(pred.get("status", "")).lower()
+                if status in COMPLETED_STATUSES:
+                    outputs = pred.get("outputs") or pred.get("output") or []
+                    if isinstance(outputs, str):
+                        outputs = [outputs]
+                    if not outputs:
+                        raise VideoGenError("Atlas Cloud completed without output URLs.")
+                    return outputs[0]
+                if status in FAILED_STATUSES:
+                    raise VideoGenError(f"Generation failed: {pred.get('error') or pred.get('message') or status}")
+                elapsed = int(time.monotonic() - started)
+                if status != last_status or time.monotonic() - last_emit >= 15:
+                    last_status, last_emit = status, time.monotonic()
+                    await self._emit_status(emitter, f"{label}: {status or 'processing'} ({elapsed}s elapsed)", done=False)
+        raise VideoGenError("Generation timed out. Try a shorter clip or lower resolution.")
+
+    # ------------------------------------------------------------------ media out
+
+    async def _save_to_openwebui(self, video_url: str, user_id: Optional[str], filename: str) -> Optional[str]:
+        """Download the MP4 and register it as an Open WebUI file. Returns the permanent relative URL."""
+        if not user_id:
+            return None
         try:
-            outputs = await self._submit_and_wait(payload, config, emitter, label)
-        except (AtlasCloudError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            from open_webui.models.files import FileForm, Files
+            from open_webui.storage.provider import Storage
+        except Exception:
+            return None
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
+            async with session.get(video_url) as resp:
+                if resp.status != 200:
+                    raise VideoGenError(f"Could not download finished video ({resp.status}).")
+                data = await resp.read()
+                content_type = resp.headers.get("Content-Type", "video/mp4").split(";")[0] or "video/mp4"
+
+        file_id = str(uuid.uuid4())
+        stored_name = f"{file_id}_{filename}"
+        _, path = await asyncio.to_thread(Storage.upload_file, io.BytesIO(data), stored_name, {"OpenWebUI-User-Id": user_id, "OpenWebUI-File-Id": file_id})
+        await Files.insert_new_file(
+            user_id,
+            FileForm(
+                id=file_id,
+                filename=stored_name,
+                path=path,
+                meta={"name": filename, "content_type": content_type, "size": len(data), "source": "kepler_seedance_video"},
+            ),
+        )
+        return f"/api/v1/files/{file_id}/content"
+
+    def _render(self, provider_url: str, saved_url: Optional[str], config: Dict[str, Any], summary: str) -> Union[str, Tuple[HTMLResponse, str]]:
+        keep_note = (
+            f"A permanent copy is saved in KeplerAI at {saved_url} (open it or attach it in later chats)."
+            if saved_url
+            else "The provider link expires in about 24 hours, so download the clip if you want to keep it."
+        )
+        context = f"{summary} Video URL: {provider_url}. {keep_note} Tell the user the clip is ready in one or two sentences."
+        if config["return_html_embed"]:
+            links = f'<a href="{provider_url}" target="_blank" rel="noopener">Download (provider link, ~24h)</a>'
+            if saved_url:
+                links = f'<a href="{saved_url}" target="_blank" rel="noopener">Download (saved in KeplerAI)</a> &middot; ' + links
+            html = (
+                f'<video controls autoplay muted playsinline src="{provider_url}" width="960" '
+                f'style="max-width:100%;border-radius:8px"></video>'
+                f'<p style="font-family:sans-serif;font-size:12px">{links}</p>'
+            )
+            return HTMLResponse(content=html, headers={"content-disposition": "inline"}), context
+        out = f"{summary}\n\n- [Provider link (expires ~24h)]({provider_url})"
+        if saved_url:
+            out += f"\n- [Saved in KeplerAI]({saved_url})"
+        return out
+
+    # ------------------------------------------------------------------ orchestration
+
+    async def _generate(
+        self,
+        config: Dict[str, Any],
+        emitter: EventEmitter,
+        user: Optional[Dict[str, Any]],
+        label: str,
+        quality: str,
+        mode: str,
+        prompt: str,
+        params: Dict[str, Any],
+        first_frame: Optional[MediaRef] = None,
+        ref_images: Optional[List[MediaRef]] = None,
+        ref_audios: Optional[List[MediaRef]] = None,
+    ) -> Union[str, Tuple[HTMLResponse, str]]:
+        if not config["api_key"]:
+            which = "BYTEPLUS_API_KEY" if config["provider"] == "byteplus" else "ATLASCLOUD_API_KEY"
+            return f"Video generation is not configured yet: an admin must set {which} in the tool's Valves."
+
+        best = str(quality).lower().strip() == "best"
+        if config["provider"] == "byteplus":
+            # ModelArk uses one model for text / first-frame / reference modes.
+            # Reference mode (multi-asset) needs Seedance 2.5, so force 'best' there.
+            model = config["byteplus_best_model"] if (best or mode == "reference") else config["byteplus_fast_model"]
+            runner = self._byteplus_generate
+        else:
+            model = {
+                "text": config["atlas_best_model"] if best else config["atlas_fast_model"],
+                "image": config["atlas_image_to_video_model"],
+                "reference": config["atlas_reference_model"],
+            }[mode]
+            runner = self._atlas_generate
+
+        await self._emit_status(emitter, f"Submitting to {model} ({config['provider']})", done=False)
+        try:
+            provider_url = await runner(config, emitter, label, model, prompt, params, first_frame, ref_images, ref_audios)
+        except (VideoGenError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
             await self._emit_status(emitter, f"Video generation error: {exc}", done=True)
             return f"Video generation failed: {exc}"
+
+        saved_url = None
+        if config["save_to_openwebui"]:
+            await self._emit_status(emitter, "Saving video to KeplerAI storage", done=False)
+            try:
+                saved_url = await self._save_to_openwebui(
+                    provider_url, (user or {}).get("id"), f"seedance-{time.strftime('%Y%m%d-%H%M%S')}.mp4"
+                )
+            except Exception as exc:  # saving is best-effort; the provider link still works
+                await self._emit_status(emitter, f"Could not save a copy ({exc}); provider link only", done=False)
+
         await self._emit_status(emitter, f"{label}: done", done=True)
-        return self._render_result(outputs, config, summary)
+        summary = f"Generated a {params['duration']}s {params['resolution']} clip with {model} via {config['provider']}."
+        return self._render(provider_url, saved_url, config, summary)
+
+    async def _prepare_refs(self, emitter: EventEmitter, refs: List[str], kind: str) -> List[MediaRef]:
+        if refs:
+            await self._emit_status(emitter, f"Preparing {len(refs)} {kind} reference(s)", done=False)
+        return [await self._resolve_media(r) for r in refs]
 
     # ------------------------------------------------------------------ tools
 
@@ -435,7 +578,7 @@ class Tools:
         prompt: str,
         duration: int = 5,
         resolution: str = "720p",
-        ratio: str = "adaptive",
+        ratio: str = "16:9",
         generate_audio: bool = True,
         quality: str = "fast",
         __event_emitter__: EventEmitter = None,
@@ -447,30 +590,23 @@ class Tools:
 
         Write the prompt as a shot description: subject, action, setting, camera movement (e.g. slow dolly in,
         handheld, aerial), lighting and style. You can direct timing with timestamps, e.g. "0-2s: ..., 2-5s: ...".
-        Keep dialogue in quotes if speech is wanted; audio is generated natively.
+        Put dialogue in quotes if speech is wanted; audio is generated natively.
 
         :param prompt: Detailed description of the shot to generate.
         :param duration: Clip length in seconds (4-10). Default 5. Longer clips cost proportionally more.
         :param resolution: 480p, 720p or 1080p. Default 720p.
-        :param ratio: Aspect ratio: 16:9, 9:16, 1:1, 4:3, 3:4, 21:9 or adaptive. Use 9:16 for social/vertical.
+        :param ratio: Aspect ratio: 16:9 (default), 9:16 for social/vertical, 1:1, 4:3, 3:4 or 21:9.
         :param generate_audio: Whether to generate synchronised sound, music and speech. Default true.
-        :param quality: "fast" (default, cheap, quick iteration) or "best" (Seedance 2.5, higher fidelity, ~6x cost). Only use "best" when the user asks for high quality or a final version.
+        :param quality: "fast" (default, cheap, quick iteration) or "best" (Seedance 2.5, higher fidelity, several times the cost). Only use "best" when the user asks for high quality or a final version.
         """
         config = self._resolve_config(__user__)
-        model = config["best_model"] if str(quality).lower().strip() == "best" else config["fast_model"]
-        payload = {
-            "model": model,
-            "prompt": prompt,
+        params = {
             "duration": self._clamp_duration(duration, config),
             "resolution": self._clamp_resolution(resolution, config),
             "ratio": self._clamp_ratio(ratio),
             "generate_audio": bool(generate_audio),
         }
-        await self._emit_status(__event_emitter__, f"Submitting to {model}", done=False)
-        return await self._run(
-            payload, config, __event_emitter__, "Rendering video",
-            f"Generated a {payload['duration']}s {payload['resolution']} clip with {model}.",
-        )
+        return await self._generate(config, __event_emitter__, __user__, "Rendering video", quality, "text", prompt, params)
 
     async def generate_video_from_image(
         self,
@@ -478,51 +614,41 @@ class Tools:
         image_url: Optional[str] = None,
         duration: int = 5,
         resolution: str = "720p",
-        ratio: str = "adaptive",
         generate_audio: bool = True,
+        quality: str = "fast",
         __event_emitter__: EventEmitter = None,
         __user__: Optional[Dict[str, Any]] = None,
         __messages__: Optional[List[Dict[str, Any]]] = None,
         __files__: Optional[List[Dict[str, Any]]] = None,
     ) -> Union[str, Tuple[HTMLResponse, str]]:
         """
-        Animate an attached image into a video (image-to-video). Use this when the user has attached ONE image and
-        wants it brought to life, animated, or used as the first frame. The image is picked up automatically from
-        the chat; only pass image_url if the user gave an explicit public https:// URL.
+        Animate an attached image into a video (image-to-video, the image becomes the first frame). Use this when the
+        user has attached ONE image and wants it brought to life or animated. The image is picked up automatically
+        from the chat; only pass image_url if the user gave an explicit public https:// URL.
 
         :param prompt: What should happen in the shot: motion, camera move, mood, any dialogue.
         :param image_url: Optional public https:// URL of the start image. Leave empty to use the attached image.
         :param duration: Clip length in seconds (4-10). Default 5.
         :param resolution: 480p, 720p or 1080p. Default 720p.
-        :param ratio: Aspect ratio or adaptive (default, follows the image).
         :param generate_audio: Whether to generate synchronised sound. Default true.
+        :param quality: "fast" (default) or "best" (Seedance 2.5).
         """
         config = self._resolve_config(__user__)
         target = image_url or next(iter(self._collect_media(__messages__, __files__, "image")), None)
         if not target:
             return "No image found. Ask the user to attach an image to the message, then call this tool again."
-
-        await self._emit_status(__event_emitter__, "Uploading reference image", done=False)
         try:
-            headers = {"Authorization": f"Bearer {config['api_key']}"}
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120), headers=headers) as session:
-                hosted = await self._ensure_atlas_media_url(session, config["base_url"], target)
-        except (AtlasCloudError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            await self._emit_status(__event_emitter__, f"Image upload error: {exc}", done=True)
-            return f"Could not prepare the reference image: {exc}"
-
-        payload = {
-            "model": config["image_to_video_model"],
-            "prompt": prompt,
-            "image_url": hosted,
+            first_frame = (await self._prepare_refs(__event_emitter__, [target], "image"))[0]
+        except (VideoGenError, OSError) as exc:
+            return f"Could not read the attached image: {exc}"
+        params = {
             "duration": self._clamp_duration(duration, config),
             "resolution": self._clamp_resolution(resolution, config),
-            "ratio": self._clamp_ratio(ratio),
+            "ratio": "adaptive",
             "generate_audio": bool(generate_audio),
         }
-        return await self._run(
-            payload, config, __event_emitter__, "Animating image",
-            f"Generated a {payload['duration']}s {payload['resolution']} clip from the attached image with {payload['model']}.",
+        return await self._generate(
+            config, __event_emitter__, __user__, "Animating image", quality, "image", prompt, params, first_frame=first_frame
         )
 
     async def generate_video_from_references(
@@ -532,7 +658,7 @@ class Tools:
         audio_urls: Optional[List[str]] = None,
         duration: int = 5,
         resolution: str = "720p",
-        ratio: str = "adaptive",
+        ratio: str = "16:9",
         generate_audio: bool = True,
         __event_emitter__: EventEmitter = None,
         __user__: Optional[Dict[str, Any]] = None,
@@ -541,53 +667,36 @@ class Tools:
     ) -> Union[str, Tuple[HTMLResponse, str]]:
         """
         Generate a video guided by SEVERAL reference assets (characters, props, environments, style frames, audio),
-        similar to Dreamina's multi-reference mode. Use this when the user attached two or more images, or an audio
-        clip, and wants them combined or kept consistent in the video. References are picked up from the chat
-        automatically. In the prompt, refer to them in attachment order as @Image1, @Image2, @Audio1, e.g.
-        "@Image1 walks through the market from @Image2, cinematic, 35mm".
+        like Dreamina's multi-reference mode. Use this when the user attached two or more images, or an audio clip,
+        and wants them combined or kept consistent in the video. References are picked up from the chat
+        automatically. In the prompt, cite them in attachment order as @Image1, @Image2, @Audio1, e.g.
+        "@Image1 walks through the market from @Image2, cinematic, 35mm". Always uses the high-quality model.
 
         :param prompt: Shot description using @Image1/@Image2/@Audio1 to cite the references.
         :param image_urls: Optional explicit public https:// image URLs. Leave empty to use attachments.
         :param audio_urls: Optional explicit public https:// audio URLs. Leave empty to use attachments.
         :param duration: Clip length in seconds (4-10). Default 5.
         :param resolution: 480p, 720p or 1080p. Default 720p.
-        :param ratio: Aspect ratio or adaptive.
+        :param ratio: Aspect ratio: 16:9 (default), 9:16, 1:1, 4:3, 3:4, 21:9 or adaptive.
         :param generate_audio: Whether to generate synchronised sound. Default true.
         """
         config = self._resolve_config(__user__)
-        images = list(image_urls or []) or self._collect_media(__messages__, __files__, "image")
-        audios = list(audio_urls or []) or self._collect_media(__messages__, __files__, "audio")
-        images = images[: config["max_ref_images"]]
-        audios = audios[: config["max_ref_audio"]]
+        images = (list(image_urls or []) or self._collect_media(__messages__, __files__, "image"))[: config["max_ref_images"]]
+        audios = (list(audio_urls or []) or self._collect_media(__messages__, __files__, "audio"))[: config["max_ref_audio"]]
         if not images and not audios:
             return "No reference images or audio found. Ask the user to attach them, then call this tool again."
-
-        await self._emit_status(
-            __event_emitter__, f"Uploading {len(images)} image and {len(audios)} audio reference(s)", done=False
-        )
         try:
-            headers = {"Authorization": f"Bearer {config['api_key']}"}
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300), headers=headers) as session:
-                hosted_images = [await self._ensure_atlas_media_url(session, config["base_url"], u) for u in images]
-                hosted_audios = [await self._ensure_atlas_media_url(session, config["base_url"], u) for u in audios]
-        except (AtlasCloudError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            await self._emit_status(__event_emitter__, f"Reference upload error: {exc}", done=True)
-            return f"Could not prepare the reference assets: {exc}"
-
-        payload: Dict[str, Any] = {
-            "model": config["reference_model"],
-            "prompt": prompt,
+            ref_images = await self._prepare_refs(__event_emitter__, images, "image")
+            ref_audios = await self._prepare_refs(__event_emitter__, audios, "audio")
+        except (VideoGenError, OSError) as exc:
+            return f"Could not read the reference assets: {exc}"
+        params = {
             "duration": self._clamp_duration(duration, config),
             "resolution": self._clamp_resolution(resolution, config),
             "ratio": self._clamp_ratio(ratio),
             "generate_audio": bool(generate_audio),
         }
-        if hosted_images:
-            payload["reference_images"] = hosted_images
-        if hosted_audios:
-            payload["reference_audios"] = hosted_audios
-
-        return await self._run(
-            payload, config, __event_emitter__, "Rendering from references",
-            f"Generated a {payload['duration']}s {payload['resolution']} clip from {len(hosted_images)} image and {len(hosted_audios)} audio reference(s) with {payload['model']}.",
+        return await self._generate(
+            config, __event_emitter__, __user__, "Rendering from references", "best", "reference", prompt, params,
+            ref_images=ref_images, ref_audios=ref_audios,
         )
