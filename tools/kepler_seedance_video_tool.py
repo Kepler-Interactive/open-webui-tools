@@ -3,7 +3,7 @@ title: Kepler Video Generator (Seedance)
 description: Generate, extend and edit short videos with ByteDance Seedance from text, attached images, reference images/audio/video. Talks to BytePlus ModelArk directly (default) or Atlas Cloud.
 author: Kepler Interactive (forked from the Atlas Cloud Media Generator by binyangzhu000-sudo & Haervwe)
 author_url: https://github.com/Kepler-Interactive/open-webui-tools
-version: 0.8.0
+version: 0.9.0
 license: MIT
 required_open_webui_version: 0.9.1
 """
@@ -173,6 +173,14 @@ class Tools:
             default=True,
             description="After extend_video, stitch source + continuation into one clip with ffmpeg (needs ffmpeg in the container).",
         )
+        JOIN_CROSSFADE_SECONDS: float = Field(
+            default=0.5, ge=0.0, le=2.0,
+            description="Crossfade length across the stitch so water/motion phase differences at the seam dissolve instead of cutting. 0 = hard cut.",
+        )
+        MAX_RERENDER_SECONDS: int = Field(
+            default=15, ge=4, le=30,
+            description="Longest clip rerender_video will re-render in high fidelity (cost control; hifi with a video input costs ~2x per second).",
+        )
         EMBED_SAVED_COPY: bool = Field(
             default=True,
             description="Play the copy saved in Open WebUI inside the chat embed via a signed link (needs the KeplerAI backend's kepler_files router). Falls back to the provider link if unavailable.",
@@ -231,6 +239,8 @@ class Tools:
             "timeout": self.valves.GENERATION_TIMEOUT_SECONDS,
             "save_to_openwebui": self.valves.SAVE_TO_OPENWEBUI,
             "join_extensions": self.valves.JOIN_EXTENSIONS,
+            "join_crossfade": float(self.valves.JOIN_CROSSFADE_SECONDS),
+            "max_rerender": int(self.valves.MAX_RERENDER_SECONDS),
             "embed_saved_copy": self.valves.EMBED_SAVED_COPY,
             "signed_link_ttl": int(self.valves.SIGNED_LINK_TTL_DAYS) * 24 * 3600,
             "return_html_embed": self.valves.RETURN_HTML_EMBED,
@@ -404,6 +414,12 @@ class Tools:
                 raise VideoGenError("Unsupported video reference. Use the last generated clip, a KeplerAI file link, or a public https:// URL.")
 
         sd = self._seedance_meta(file)
+        # Preferred: a signed KeplerAI link (works for stitched clips, old clips and user uploads, and it
+        # is the whole saved file rather than just the newest segment). Verified 2026-09-07 that
+        # ModelArk fetches these. Fallback: the provider's own link while it is still valid.
+        signed = self._signed_public_url(file.id)
+        if signed:
+            return signed, sd, file
         url = self._unexpired_provider_url(sd)
         if not url:
             when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(file.created_at or 0))
@@ -414,27 +430,55 @@ class Tools:
             )
         return url, sd, file
 
+    @staticmethod
+    def _signed_public_url(file_id: str, ttl_seconds: int = 6 * 3600) -> Optional[str]:
+        """Absolute signed URL to a stored file for the video provider to fetch (needs WEBUI_URL)."""
+        try:
+            from open_webui.config import WEBUI_URL
+            from open_webui.routers.kepler_files import sign_file_url
+        except Exception:
+            return None
+        base = (WEBUI_URL or "").rstrip("/")
+        if not base.startswith("https://"):
+            return None
+        return base + sign_file_url(file_id, ttl_seconds)
+
     # ------------------------------------------------------------------ ffmpeg join
 
     @staticmethod
-    def _ffprobe(ffprobe: str, path: str) -> Dict[str, Any]:
-        out = subprocess.run(
-            [ffprobe, "-v", "error", "-show_entries", "stream=codec_type,width,height", "-of", "json", path],
-            capture_output=True, text=True, timeout=60,
-        )
-        info: Dict[str, Any] = {"has_audio": False, "width": 0, "height": 0}
-        try:
-            for st in json.loads(out.stdout or "{}").get("streams", []):
-                if st.get("codec_type") == "video" and not info["width"]:
-                    info["width"], info["height"] = int(st.get("width") or 0), int(st.get("height") or 0)
-                if st.get("codec_type") == "audio":
-                    info["has_audio"] = True
-        except ValueError:
-            pass
+    def _probe(ffmpeg: str, ffprobe: Optional[str], path: str) -> Dict[str, Any]:
+        """Streams + duration. Uses ffprobe when present, else parses ffmpeg's banner."""
+        info: Dict[str, Any] = {"has_audio": False, "width": 0, "height": 0, "duration": 0.0}
+        if ffprobe:
+            out = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "stream=codec_type,width,height:format=duration", "-of", "json", path],
+                capture_output=True, text=True, timeout=60,
+            )
+            try:
+                data = json.loads(out.stdout or "{}")
+                for st in data.get("streams", []):
+                    if st.get("codec_type") == "video" and not info["width"]:
+                        info["width"], info["height"] = int(st.get("width") or 0), int(st.get("height") or 0)
+                    if st.get("codec_type") == "audio":
+                        info["has_audio"] = True
+                info["duration"] = float((data.get("format") or {}).get("duration") or 0)
+                return info
+            except (ValueError, TypeError):
+                pass
+        banner = subprocess.run([ffmpeg, "-hide_banner", "-i", path], capture_output=True, text=True, timeout=60).stderr
+        m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", banner)
+        if m:
+            info["duration"] = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
+        m = re.search(r"Video: .*?(\d{2,5})x(\d{2,5})", banner)
+        if m:
+            info["width"], info["height"] = int(m[1]), int(m[2])
+        info["has_audio"] = "Audio:" in banner
         return info
 
-    def _concat_videos(self, first: bytes, second: bytes) -> bytes:
-        """Stitch two MP4s back to back (re-encoded so mismatched params never break the join)."""
+    def _concat_videos(self, first: bytes, second: bytes, crossfade: float = 0.0) -> Tuple[bytes, float]:
+        """Stitch two MP4s back to back (re-encoded so mismatched params never break the join).
+        With crossfade > 0 the seam is a short dissolve, which hides motion-phase jumps (ripples, etc.).
+        Returns (mp4 bytes, total duration seconds)."""
         ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
         if not ffmpeg:
             raise VideoGenError("ffmpeg is not available on the server")
@@ -444,24 +488,38 @@ class Tools:
                 fh.write(first)
             with open(b, "wb") as fh:
                 fh.write(second)
-            pa = self._ffprobe(ffprobe, a) if ffprobe else {"has_audio": True, "width": 0, "height": 0}
-            pb = self._ffprobe(ffprobe, b) if ffprobe else {"has_audio": True, "width": 0, "height": 0}
+            pa, pb = self._probe(ffmpeg, ffprobe, a), self._probe(ffmpeg, ffprobe, b)
             w, h = (pa["width"] or pb["width"] or 1280), (pa["height"] or pb["height"] or 720)
             scale = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24"
             with_audio = pa["has_audio"] and pb["has_audio"]
-            if with_audio:
-                fc = f"[0:v]{scale}[v0];[1:v]{scale}[v1];[0:a]aresample=48000[a0];[1:a]aresample=48000[a1];[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]"
-                maps = ["-map", "[v]", "-map", "[a]", "-c:a", "aac", "-b:a", "128k"]
+            da, db = float(pa["duration"] or 0), float(pb["duration"] or 0)
+            xf = min(float(crossfade or 0), 2.0)
+            use_xfade = xf > 0.05 and da > xf + 0.5 and db > xf + 0.5
+            if use_xfade:
+                off = round(da - xf, 3)
+                total = da + db - xf
+                if with_audio:
+                    fc = (f"[0:v]{scale}[v0];[1:v]{scale}[v1];[v0][v1]xfade=transition=fade:duration={xf}:offset={off}[v];"
+                          f"[0:a]aresample=48000[a0];[1:a]aresample=48000[a1];[a0][a1]acrossfade=d={xf}[a]")
+                    maps = ["-map", "[v]", "-map", "[a]", "-c:a", "aac", "-b:a", "128k"]
+                else:
+                    fc = f"[0:v]{scale}[v0];[1:v]{scale}[v1];[v0][v1]xfade=transition=fade:duration={xf}:offset={off}[v]"
+                    maps = ["-map", "[v]", "-an"]
             else:
-                fc = f"[0:v]{scale}[v0];[1:v]{scale}[v1];[v0][v1]concat=n=2:v=1:a=0[v]"
-                maps = ["-map", "[v]", "-an"]
+                total = da + db
+                if with_audio:
+                    fc = f"[0:v]{scale}[v0];[1:v]{scale}[v1];[0:a]aresample=48000[a0];[1:a]aresample=48000[a1];[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]"
+                    maps = ["-map", "[v]", "-map", "[a]", "-c:a", "aac", "-b:a", "128k"]
+                else:
+                    fc = f"[0:v]{scale}[v0];[1:v]{scale}[v1];[v0][v1]concat=n=2:v=1:a=0[v]"
+                    maps = ["-map", "[v]", "-an"]
             cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", a, "-i", b, "-filter_complex", fc, *maps,
                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart", out]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             if res.returncode != 0 or not os.path.exists(out):
                 raise VideoGenError(f"ffmpeg concat failed: {(res.stderr or '').strip()[-300:]}")
             with open(out, "rb") as fh:
-                return fh.read()
+                return fh.read(), total
 
     @staticmethod
     def _last_frame_jpeg(video: bytes) -> bytes:
@@ -773,8 +831,8 @@ class Tools:
         embed_url = embed_url or provider_url
         if saved_url:
             keep_note = (
-                f"A permanent copy is saved in KeplerAI at {saved_url}. It can be extended or edited "
-                "with the video tools for the next 24 hours by just asking (e.g. 'extend it', 'make the boat red')."
+                f"A permanent copy is saved in KeplerAI at {saved_url}. It can be extended, edited or re-rendered in "
+                "high fidelity later by just asking (e.g. 'extend it', 'make the boat red', 'make a hifi version')."
             )
         else:
             keep_note = "The provider link expires in about 24 hours, so download the clip if you want to keep it."
@@ -844,7 +902,7 @@ class Tools:
 
         # Quality tier -> model. Multi-reference mode needs Seedance 2.5, so it always runs on 'hifi'.
         tier = TIER_ALIASES.get(str(quality or "").lower().strip(), config["default_quality"])
-        if mode == "reference":
+        if mode in ("reference", "rerender"):
             tier = "hifi"
         if config["provider"] == "byteplus":
             # ModelArk uses one model id for text / first-frame / reference / edit / extend inputs.
@@ -857,6 +915,7 @@ class Tools:
                 "reference": config["atlas_reference_model"],
                 "extend": config["atlas_reference_model"],
                 "edit": config["atlas_reference_model"],
+                "rerender": config["atlas_reference_model"],
             }[mode]
             runner = self._atlas_generate
 
@@ -902,10 +961,10 @@ class Tools:
                     await self._emit_status(emitter, "Stitching source and continuation into one clip", done=False)
                     try:
                         src_bytes = join_source.get("bytes") or await self._read_file_bytes(join_source.get("file"), join_source.get("url"))
-                        data = await asyncio.to_thread(self._concat_videos, src_bytes, data)
+                        data, joined_secs = await asyncio.to_thread(self._concat_videos, src_bytes, data, config["join_crossfade"])
                         content_type = "video/mp4"
                         joined = True
-                        total_duration = int(join_source.get("duration") or 0) + params["duration"]
+                        total_duration = int(round(joined_secs)) if joined_secs else int(join_source.get("duration") or 0) + params["duration"]
                     except Exception as exc:
                         log.exception("kepler_seedance_video: stitching extension failed")
                         await self._emit_status(emitter, f"Could not stitch clips ({exc}); saving the continuation only", done=False)
@@ -969,6 +1028,7 @@ class Tools:
                 "reference": "Generated from the references",
                 "extend": "Extended the source clip into (continuation segment only)",
                 "edit": "Edited the source clip into",
+                "rerender": "Re-rendered the source clip in high fidelity as",
             }.get(mode, "Generated")
             summary = f"{verb} a {params['duration']}s {params['resolution']} clip with {model} ({tier} tier) via {config['provider']}."
         return self._render(provider_url, saved_url, config, summary, save_error, usage_note, params.get("ratio") or "16:9", embed_url)
@@ -1211,6 +1271,80 @@ class Tools:
             config, __event_emitter__, __user__, "Extending video", quality or src_meta.get("tier") or "", "extend", text, params,
             ref_images=ref_images, ref_videos=[src_url], chat_id=chat_id, source_url=src_url,
             join_source={"url": src_url, "file": src_file, "bytes": src_bytes, "duration": src_meta.get("duration")},
+        )
+
+    def _video_duration(self, data: bytes) -> float:
+        ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+        if not ffmpeg:
+            return 0.0
+        with tempfile.TemporaryDirectory(prefix="kepler_seedance_") as tmp:
+            p = os.path.join(tmp, "src.mp4")
+            with open(p, "wb") as fh:
+                fh.write(data)
+            return float(self._probe(ffmpeg, ffprobe, p).get("duration") or 0.0)
+
+    async def rerender_video(
+        self,
+        prompt: str = "",
+        source_video: str = "",
+        resolution: str = "1080p",
+        generate_audio: bool = True,
+        __event_emitter__: EventEmitter = None,
+        __user__: Optional[Dict[str, Any]] = None,
+        __metadata__: Optional[Dict[str, Any]] = None,
+        __messages__: Optional[List[Dict[str, Any]]] = None,
+        __files__: Optional[List[Dict[str, Any]]] = None,
+    ) -> Union[str, Tuple[HTMLResponse, str]]:
+        """
+        RE-RENDER an existing clip in HIGH FIDELITY (Seedance 2.5) keeping the same shot: same subject, composition,
+        camera, motion and timing, just rendered with more detail and at higher resolution. Use when the user is happy
+        with a draft and asks for a "hifi", "high quality", "final", "polished", "upscaled" or "production" version of
+        it. By default the source is the most recent clip in this chat (including stitched extensions). This always
+        uses the high-fidelity model and costs several times a draft clip.
+
+        :param prompt: Optional small adjustments to apply while re-rendering (e.g. "slightly warmer light"). Leave empty to reproduce the draft faithfully.
+        :param source_video: Leave empty for the last clip in this chat. Otherwise a KeplerAI file link or a public https:// video URL.
+        :param resolution: Output resolution, default 1080p. 720p is cheaper.
+        :param generate_audio: Whether to generate synchronised sound. Default true.
+        """
+        config = self._resolve_config(__user__)
+        user_id, chat_id = (__user__ or {}).get("id"), self._chat_id(__metadata__)
+        src = source_video or next(iter(self._collect_media(__messages__, __files__, "video")), "")
+        try:
+            src_url, src_meta, src_file = await self._resolve_video_source(src, user_id, chat_id)
+        except VideoGenError as exc:
+            return f"Cannot re-render: {exc}"
+
+        src_duration = float(src_meta.get("duration") or 0)
+        if not src_duration:
+            try:
+                src_duration = await asyncio.to_thread(self._video_duration, await self._read_file_bytes(src_file, src_url))
+            except Exception as exc:
+                log.warning("kepler_seedance_video: could not probe source duration (%s)", exc)
+        duration = int(round(src_duration)) if src_duration else config["default_duration"]
+        duration = min(max(duration, 4), config["max_rerender"])
+        if src_duration and duration < int(src_duration) - 1:
+            await self._emit_status(
+                __event_emitter__, f"Source is {int(src_duration)}s; re-rendering the first {duration}s (MAX_RERENDER_SECONDS cap)", done=False
+            )
+
+        adjust = prompt.strip().rstrip(".")
+        text = (
+            "Recreate Video 1 exactly: the same subject, scene, composition, camera angle, framing, motion, timing and "
+            "lighting. Do not change the content. Render it at higher visual fidelity with finer detail, cleaner "
+            "textures and more realistic materials, reflections and lighting."
+        )
+        if adjust:
+            text += f" Adjustments: {adjust}."
+        params = {
+            "duration": duration,
+            "resolution": self._clamp_resolution(resolution or "1080p", config),
+            "ratio": self._clamp_ratio(src_meta.get("ratio") or "adaptive"),
+            "generate_audio": bool(generate_audio),
+        }
+        return await self._generate(
+            config, __event_emitter__, __user__, "Re-rendering in high fidelity", "hifi", "rerender", text, params,
+            ref_videos=[src_url], chat_id=chat_id, source_url=src_url,
         )
 
     async def edit_video(
