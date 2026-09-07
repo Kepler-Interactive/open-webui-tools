@@ -3,7 +3,7 @@ title: Kepler Video Generator (Seedance)
 description: Generate, extend and edit short videos with ByteDance Seedance from text, attached images, reference images/audio/video. Talks to BytePlus ModelArk directly (default) or Atlas Cloud.
 author: Kepler Interactive (forked from the Atlas Cloud Media Generator by binyangzhu000-sudo & Haervwe)
 author_url: https://github.com/Kepler-Interactive/open-webui-tools
-version: 0.7.0
+version: 0.7.1
 license: MIT
 required_open_webui_version: 0.9.1
 """
@@ -783,10 +783,13 @@ class Tools:
                 '.wrap video{width:100%;height:100%;display:block;object-fit:contain;background:#000;border-radius:10px}'
                 '.meta{font-family:system-ui,sans-serif;font-size:12px;margin:8px 4px 0;line-height:1.5}'
                 '.meta a{color:#3b82f6;text-decoration:none}.meta a:hover{text-decoration:underline}</style>'
-                f'<div class="wrap"><video id="v" controls autoplay muted playsinline preload="metadata" src="{embed_url}"></video></div>'
-                f'<p class="meta">{links}{usage_html}</p>'
-                "<script>(function(){function r(){try{var h=document.documentElement.scrollHeight;"
-                "parent.postMessage({type:'iframe:height',height:h+8},'*')}catch(e){}}"
+                f'<div id="root"><div class="wrap"><video id="v" controls autoplay muted playsinline preload="metadata" src="{embed_url}"></video></div>'
+                f'<p class="meta">{links}{usage_html}</p></div>'
+                # Measure the content wrapper, never the document: documentElement.scrollHeight is
+                # floored at the viewport height, so posting it back after each resize inflates the
+                # frame forever (that was the blank-space bug). Only post when the value changes.
+                "<script>(function(){var last=0;function r(){try{var h=Math.ceil(document.getElementById('root').getBoundingClientRect().height)+4;"
+                "if(Math.abs(h-last)>2){last=h;parent.postMessage({type:'iframe:height',height:h},'*')}}catch(e){}}"
                 "var v=document.getElementById('v');v.addEventListener('loadedmetadata',r);"
                 "window.addEventListener('load',r);window.addEventListener('resize',r);setTimeout(r,300);setTimeout(r,1500)})();</script>"
             )
