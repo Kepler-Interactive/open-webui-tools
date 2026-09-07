@@ -3,7 +3,7 @@ title: Kepler Video Generator (Seedance)
 description: Generate, extend and edit short videos with ByteDance Seedance from text, attached images, reference images/audio/video. Talks to BytePlus ModelArk directly (default) or Atlas Cloud.
 author: Kepler Interactive (forked from the Atlas Cloud Media Generator by binyangzhu000-sudo & Haervwe)
 author_url: https://github.com/Kepler-Interactive/open-webui-tools
-version: 0.5.1
+version: 0.6.0
 license: MIT
 required_open_webui_version: 0.9.1
 """
@@ -27,8 +27,13 @@ required_open_webui_version: 0.9.1
 import asyncio
 import base64
 import io
+import json
 import logging
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -164,6 +169,14 @@ class Tools:
             default=True,
             description="Download the finished MP4 into Open WebUI file storage (provider links expire after ~24h).",
         )
+        JOIN_EXTENSIONS: bool = Field(
+            default=True,
+            description="After extend_video, stitch source + continuation into one clip with ffmpeg (needs ffmpeg in the container).",
+        )
+        EMBED_SAVED_COPY: bool = Field(
+            default=False,
+            description="Play the copy saved in Open WebUI inside the chat embed. Only works if users enable Settings > Interface > 'iframe sandbox: allow same origin'; otherwise the embed plays the provider link and joined clips are offered as a download.",
+        )
         RETURN_HTML_EMBED: bool = Field(default=True, description="Render an inline video player in the chat.")
 
     def __init__(self) -> None:
@@ -216,6 +229,8 @@ class Tools:
             "poll_interval": self.valves.POLL_INTERVAL_SECONDS,
             "timeout": self.valves.GENERATION_TIMEOUT_SECONDS,
             "save_to_openwebui": self.valves.SAVE_TO_OPENWEBUI,
+            "join_extensions": self.valves.JOIN_EXTENSIONS,
+            "embed_saved_copy": self.valves.EMBED_SAVED_COPY,
             "return_html_embed": self.valves.RETURN_HTML_EMBED,
         }
 
@@ -361,9 +376,9 @@ class Tools:
 
     async def _resolve_video_source(
         self, source: Optional[str], user_id: Optional[str], chat_id: Optional[str]
-    ) -> Tuple[str, Dict[str, Any]]:
-        """Return (public_url, seedance_meta) for a source video. ModelArk only fetches public web URLs,
-        so KeplerAI files are usable only via their stored provider URL (valid ~24h after generation)."""
+    ) -> Tuple[str, Dict[str, Any], Any]:
+        """Return (public_url, seedance_meta, owui_file_or_None) for a source video. ModelArk only fetches
+        public web URLs, so KeplerAI files are usable only via their stored provider URL (valid ~24h)."""
         s = (source or "").strip()
         file = None
 
@@ -382,7 +397,7 @@ class Tools:
                 if not file:
                     raise VideoGenError("That KeplerAI file was not found.")
             elif s.startswith("https://") or s.startswith("http://"):
-                return s, {}
+                return s, {}, None
             else:
                 raise VideoGenError("Unsupported video reference. Use the last generated clip, a KeplerAI file link, or a public https:// URL.")
 
@@ -395,7 +410,73 @@ class Tools:
                 "ByteDance only accepts public web URLs and its own links expire after 24 hours. "
                 "Regenerate the clip, or host the MP4 at a public https:// URL and pass that."
             )
-        return url, sd
+        return url, sd, file
+
+    # ------------------------------------------------------------------ ffmpeg join
+
+    @staticmethod
+    def _ffprobe(ffprobe: str, path: str) -> Dict[str, Any]:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "stream=codec_type,width,height", "-of", "json", path],
+            capture_output=True, text=True, timeout=60,
+        )
+        info: Dict[str, Any] = {"has_audio": False, "width": 0, "height": 0}
+        try:
+            for st in json.loads(out.stdout or "{}").get("streams", []):
+                if st.get("codec_type") == "video" and not info["width"]:
+                    info["width"], info["height"] = int(st.get("width") or 0), int(st.get("height") or 0)
+                if st.get("codec_type") == "audio":
+                    info["has_audio"] = True
+        except ValueError:
+            pass
+        return info
+
+    def _concat_videos(self, first: bytes, second: bytes) -> bytes:
+        """Stitch two MP4s back to back (re-encoded so mismatched params never break the join)."""
+        ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+        if not ffmpeg:
+            raise VideoGenError("ffmpeg is not available on the server")
+        with tempfile.TemporaryDirectory(prefix="kepler_seedance_") as tmp:
+            a, b, out = os.path.join(tmp, "a.mp4"), os.path.join(tmp, "b.mp4"), os.path.join(tmp, "joined.mp4")
+            with open(a, "wb") as fh:
+                fh.write(first)
+            with open(b, "wb") as fh:
+                fh.write(second)
+            pa = self._ffprobe(ffprobe, a) if ffprobe else {"has_audio": True, "width": 0, "height": 0}
+            pb = self._ffprobe(ffprobe, b) if ffprobe else {"has_audio": True, "width": 0, "height": 0}
+            w, h = (pa["width"] or pb["width"] or 1280), (pa["height"] or pb["height"] or 720)
+            scale = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24"
+            with_audio = pa["has_audio"] and pb["has_audio"]
+            if with_audio:
+                fc = f"[0:v]{scale}[v0];[1:v]{scale}[v1];[0:a]aresample=48000[a0];[1:a]aresample=48000[a1];[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]"
+                maps = ["-map", "[v]", "-map", "[a]", "-c:a", "aac", "-b:a", "128k"]
+            else:
+                fc = f"[0:v]{scale}[v0];[1:v]{scale}[v1];[v0][v1]concat=n=2:v=1:a=0[v]"
+                maps = ["-map", "[v]", "-an"]
+            cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", a, "-i", b, "-filter_complex", fc, *maps,
+                   "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart", out]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if res.returncode != 0 or not os.path.exists(out):
+                raise VideoGenError(f"ffmpeg concat failed: {(res.stderr or '').strip()[-300:]}")
+            with open(out, "rb") as fh:
+                return fh.read()
+
+    async def _read_file_bytes(self, file: Any, fallback_url: Optional[str]) -> bytes:
+        if file is not None and getattr(file, "path", None):
+            try:
+                from open_webui.storage.provider import Storage
+                local_path = await asyncio.to_thread(Storage.get_file, file.path)
+                with open(local_path, "rb") as fh:
+                    return fh.read()
+            except Exception as exc:
+                log.warning("kepler_seedance_video: reading stored source failed (%s); downloading instead", exc)
+        if not fallback_url:
+            raise VideoGenError("Source video bytes unavailable")
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
+            async with session.get(fallback_url) as resp:
+                if resp.status != 200:
+                    raise VideoGenError(f"Could not download source video ({resp.status})")
+                return await resp.read()
 
     def _collect_media(
         self,
@@ -602,10 +683,18 @@ class Tools:
 
     # ------------------------------------------------------------------ media out
 
-    async def _save_to_openwebui(
-        self, video_url: str, user_id: Optional[str], filename: str, extra_meta: Optional[Dict[str, Any]] = None
+    async def _download(self, url: str) -> Tuple[bytes, str]:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    raise VideoGenError(f"Could not download finished video ({resp.status}).")
+                data = await resp.read()
+                return data, (resp.headers.get("Content-Type", "video/mp4").split(";")[0] or "video/mp4")
+
+    async def _save_bytes_to_openwebui(
+        self, data: bytes, content_type: str, user_id: Optional[str], filename: str, extra_meta: Optional[Dict[str, Any]] = None
     ) -> Optional[str]:
-        """Download the MP4 and register it as an Open WebUI file. Returns the permanent relative URL."""
+        """Register bytes as an Open WebUI file. Returns the permanent relative URL."""
         if not user_id:
             return None
         try:
@@ -613,13 +702,6 @@ class Tools:
             from open_webui.storage.provider import Storage
         except Exception:
             return None
-
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
-            async with session.get(video_url) as resp:
-                if resp.status != 200:
-                    raise VideoGenError(f"Could not download finished video ({resp.status}).")
-                data = await resp.read()
-                content_type = resp.headers.get("Content-Type", "video/mp4").split(";")[0] or "video/mp4"
 
         file_id = str(uuid.uuid4())
         stored_name = f"{file_id}_{filename}"
@@ -652,7 +734,9 @@ class Tools:
         save_error: Optional[str] = None,
         usage_note: str = "",
         ratio: str = "16:9",
+        embed_url: Optional[str] = None,
     ) -> Union[str, Tuple[HTMLResponse, str]]:
+        embed_url = embed_url or provider_url
         if saved_url:
             keep_note = (
                 f"A permanent copy is saved in KeplerAI at {saved_url}. It can be extended or edited "
@@ -684,7 +768,7 @@ class Tools:
                 '.wrap video{width:100%;height:100%;display:block;object-fit:contain;background:#000;border-radius:10px}'
                 '.meta{font-family:system-ui,sans-serif;font-size:12px;margin:8px 4px 0;line-height:1.5}'
                 '.meta a{color:#3b82f6;text-decoration:none}.meta a:hover{text-decoration:underline}</style>'
-                f'<div class="wrap"><video id="v" controls autoplay muted playsinline preload="metadata" src="{provider_url}"></video></div>'
+                f'<div class="wrap"><video id="v" controls autoplay muted playsinline preload="metadata" src="{embed_url}"></video></div>'
                 f'<p class="meta">{links}{usage_html}</p>'
                 "<script>(function(){function r(){try{var h=document.documentElement.scrollHeight;"
                 "parent.postMessage({type:'iframe:height',height:h+8},'*')}catch(e){}}"
@@ -715,6 +799,7 @@ class Tools:
         ref_videos: Optional[List[str]] = None,
         chat_id: Optional[str] = None,
         source_url: Optional[str] = None,
+        join_source: Optional[Dict[str, Any]] = None,
     ) -> Union[str, Tuple[HTMLResponse, str]]:
         if not config["api_key"]:
             which = "BYTEPLUS_API_KEY" if config["provider"] == "byteplus" else "ATLASCLOUD_API_KEY"
@@ -770,12 +855,27 @@ class Tools:
             result.get("task_id"), (user or {}).get("id"), chat_id,
         )
 
-        saved_url, save_error = None, None
+        saved_url, save_error, embed_url = None, None, None
+        joined, total_duration = False, params["duration"]
         if config["save_to_openwebui"]:
             await self._emit_status(emitter, "Saving video to KeplerAI storage", done=False)
             try:
-                saved_url = await self._save_to_openwebui(
-                    provider_url,
+                data, content_type = await self._download(provider_url)
+                if join_source and config["join_extensions"]:
+                    await self._emit_status(emitter, "Stitching source and continuation into one clip", done=False)
+                    try:
+                        src_bytes = await self._read_file_bytes(join_source.get("file"), join_source.get("url"))
+                        data = await asyncio.to_thread(self._concat_videos, src_bytes, data)
+                        content_type = "video/mp4"
+                        joined = True
+                        total_duration = int(join_source.get("duration") or 0) + params["duration"]
+                    except Exception as exc:
+                        log.exception("kepler_seedance_video: stitching extension failed")
+                        await self._emit_status(emitter, f"Could not stitch clips ({exc}); saving the continuation only", done=False)
+                src_file = join_source.get("file") if join_source else None
+                saved_url = await self._save_bytes_to_openwebui(
+                    data,
+                    content_type,
                     (user or {}).get("id"),
                     f"seedance-{time.strftime('%Y%m%d-%H%M%S')}.mp4",
                     {
@@ -788,11 +888,16 @@ class Tools:
                             "seed": result.get("seed"),
                             "tokens": tokens,
                             "prompt": prompt,
-                            "duration": params["duration"],
+                            "duration": total_duration,
+                            "segment_duration": params["duration"],
+                            "joined": joined,
+                            "joined_from": getattr(src_file, "id", None) if joined else None,
                             "resolution": params["resolution"],
                             "ratio": params["ratio"],
                             "chat_id": chat_id,
                             "source_video": source_url,
+                            # Always the provider link of the NEWEST segment: that is what a further
+                            # extension must continue from, and the only URL ByteDance can fetch.
                             "provider_url": provider_url,
                             "provider_url_expires_at": int(time.time()) + PROVIDER_URL_TTL_SECONDS,
                         }
@@ -800,20 +905,29 @@ class Tools:
                 )
                 if not saved_url:
                     save_error = "storage layer unavailable or no user id"
+                elif config["embed_saved_copy"]:
+                    embed_url = saved_url
             except Exception as exc:  # saving is best-effort; the provider link still works
                 save_error = str(exc)
                 log.exception("kepler_seedance_video: saving video into Open WebUI storage failed")
 
         await self._emit_status(emitter, f"{label}: done", done=True)
-        verb = {
-            "text": "Generated",
-            "image": "Animated the attached image into",
-            "reference": "Generated from the references",
-            "extend": "Extended the source clip into",
-            "edit": "Edited the source clip into",
-        }.get(mode, "Generated")
-        summary = f"{verb} a {params['duration']}s {params['resolution']} clip with {model} ({tier} tier) via {config['provider']}."
-        return self._render(provider_url, saved_url, config, summary, save_error, usage_note, params.get("ratio") or "16:9")
+        if mode == "extend" and joined:
+            summary = (
+                f"Extended the clip to {total_duration}s total: the saved copy in KeplerAI is the full joined video "
+                f"(original + {params['duration']}s continuation); the provider link and the player show only the new "
+                f"{params['duration']}s segment. {params['resolution']}, {model} ({tier} tier) via {config['provider']}."
+            )
+        else:
+            verb = {
+                "text": "Generated",
+                "image": "Animated the attached image into",
+                "reference": "Generated from the references",
+                "extend": "Extended the source clip into (continuation segment only)",
+                "edit": "Edited the source clip into",
+            }.get(mode, "Generated")
+            summary = f"{verb} a {params['duration']}s {params['resolution']} clip with {model} ({tier} tier) via {config['provider']}."
+        return self._render(provider_url, saved_url, config, summary, save_error, usage_note, params.get("ratio") or "16:9", embed_url)
 
     async def _prepare_refs(self, emitter: EventEmitter, refs: List[str], kind: str) -> List[MediaRef]:
         if refs:
@@ -827,7 +941,7 @@ class Tools:
         if refs:
             await self._emit_status(emitter, f"Resolving {len(refs)} video reference(s)", done=False)
         for r in refs:
-            url, _ = await self._resolve_video_source(r, user_id, chat_id)
+            url, _, _ = await self._resolve_video_source(r, user_id, chat_id)
             out.append(url)
         return out
 
@@ -999,7 +1113,8 @@ class Tools:
         CONTINUE an existing clip: generates the next few seconds after the source video ends, keeping the same
         subject, setting, camera and style. Use when the user says things like "extend it", "continue the video",
         "what happens next", "make it longer". By default the source is the most recent clip generated in this chat,
-        so you usually do not need to pass source_video. The result is a new clip of the continuation only.
+        so you usually do not need to pass source_video. The saved copy in KeplerAI is the full joined video
+        (original followed by the continuation); the inline player shows only the new segment.
 
         :param prompt: What should happen next (e.g. "the boat reaches the edge of the puddle and stops"). Write it as a continuation; the tool adds the technical framing.
         :param source_video: Leave empty for the last clip generated in this chat. Otherwise a KeplerAI file link or a public https:// video URL. Clips older than 24 hours cannot be used.
@@ -1012,7 +1127,7 @@ class Tools:
         user_id, chat_id = (__user__ or {}).get("id"), self._chat_id(__metadata__)
         src = source_video or next(iter(self._collect_media(__messages__, __files__, "video")), "")
         try:
-            src_url, src_meta = await self._resolve_video_source(src, user_id, chat_id)
+            src_url, src_meta, src_file = await self._resolve_video_source(src, user_id, chat_id)
         except VideoGenError as exc:
             return f"Cannot extend: {exc}"
         text = prompt.strip()
@@ -1030,6 +1145,7 @@ class Tools:
         return await self._generate(
             config, __event_emitter__, __user__, "Extending video", quality or src_meta.get("tier") or "", "extend", text, params,
             ref_videos=[src_url], chat_id=chat_id, source_url=src_url,
+            join_source={"url": src_url, "file": src_file, "duration": src_meta.get("duration")},
         )
 
     async def edit_video(
@@ -1062,7 +1178,7 @@ class Tools:
         user_id, chat_id = (__user__ or {}).get("id"), self._chat_id(__metadata__)
         src = source_video or next(iter(self._collect_media(__messages__, __files__, "video")), "")
         try:
-            src_url, src_meta = await self._resolve_video_source(src, user_id, chat_id)
+            src_url, src_meta, _ = await self._resolve_video_source(src, user_id, chat_id)
         except VideoGenError as exc:
             return f"Cannot edit: {exc}"
         text = prompt.strip()
