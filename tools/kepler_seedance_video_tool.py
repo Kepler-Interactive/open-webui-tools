@@ -3,7 +3,7 @@ title: Kepler Video Generator (Seedance)
 description: Generate, extend and edit short videos with ByteDance Seedance from text, attached images, reference images/audio/video. Talks to BytePlus ModelArk directly (default) or Atlas Cloud.
 author: Kepler Interactive (forked from the Atlas Cloud Media Generator by binyangzhu000-sudo & Haervwe)
 author_url: https://github.com/Kepler-Interactive/open-webui-tools
-version: 0.6.0
+version: 0.7.0
 license: MIT
 required_open_webui_version: 0.9.1
 """
@@ -174,9 +174,10 @@ class Tools:
             description="After extend_video, stitch source + continuation into one clip with ffmpeg (needs ffmpeg in the container).",
         )
         EMBED_SAVED_COPY: bool = Field(
-            default=False,
-            description="Play the copy saved in Open WebUI inside the chat embed. Only works if users enable Settings > Interface > 'iframe sandbox: allow same origin'; otherwise the embed plays the provider link and joined clips are offered as a download.",
+            default=True,
+            description="Play the copy saved in Open WebUI inside the chat embed via a signed link (needs the KeplerAI backend's kepler_files router). Falls back to the provider link if unavailable.",
         )
+        SIGNED_LINK_TTL_DAYS: int = Field(default=30, ge=1, le=365, description="Lifetime of the signed embed link for saved clips.")
         RETURN_HTML_EMBED: bool = Field(default=True, description="Render an inline video player in the chat.")
 
     def __init__(self) -> None:
@@ -231,6 +232,7 @@ class Tools:
             "save_to_openwebui": self.valves.SAVE_TO_OPENWEBUI,
             "join_extensions": self.valves.JOIN_EXTENSIONS,
             "embed_saved_copy": self.valves.EMBED_SAVED_COPY,
+            "signed_link_ttl": int(self.valves.SIGNED_LINK_TTL_DAYS) * 24 * 3600,
             "return_html_embed": self.valves.RETURN_HTML_EMBED,
         }
 
@@ -691,10 +693,23 @@ class Tools:
                 data = await resp.read()
                 return data, (resp.headers.get("Content-Type", "video/mp4").split(";")[0] or "video/mp4")
 
+    @staticmethod
+    def _signed_embed_url(file_id: str, ttl_seconds: int) -> Optional[str]:
+        """Signed, session-free link served by the KeplerAI backend (routers/kepler_files.py)."""
+        try:
+            from open_webui.routers.kepler_files import sign_file_url
+        except Exception:
+            return None
+        try:
+            return sign_file_url(file_id, ttl_seconds)
+        except Exception:
+            log.exception("kepler_seedance_video: signing embed link failed")
+            return None
+
     async def _save_bytes_to_openwebui(
         self, data: bytes, content_type: str, user_id: Optional[str], filename: str, extra_meta: Optional[Dict[str, Any]] = None
-    ) -> Optional[str]:
-        """Register bytes as an Open WebUI file. Returns the permanent relative URL."""
+    ) -> Optional[Tuple[str, str]]:
+        """Register bytes as an Open WebUI file. Returns (permanent relative URL, file id)."""
         if not user_id:
             return None
         try:
@@ -723,7 +738,7 @@ class Tools:
                 },
             ),
         )
-        return f"/api/v1/files/{file_id}/content"
+        return f"/api/v1/files/{file_id}/content", file_id
 
     def _render(
         self,
@@ -873,7 +888,7 @@ class Tools:
                         log.exception("kepler_seedance_video: stitching extension failed")
                         await self._emit_status(emitter, f"Could not stitch clips ({exc}); saving the continuation only", done=False)
                 src_file = join_source.get("file") if join_source else None
-                saved_url = await self._save_bytes_to_openwebui(
+                saved = await self._save_bytes_to_openwebui(
                     data,
                     content_type,
                     (user or {}).get("id"),
@@ -903,20 +918,27 @@ class Tools:
                         }
                     },
                 )
+                saved_url, saved_id = saved if saved else (None, None)
                 if not saved_url:
                     save_error = "storage layer unavailable or no user id"
                 elif config["embed_saved_copy"]:
-                    embed_url = saved_url
+                    # Session-free signed link so the sandboxed chat embed can play the saved (possibly
+                    # stitched) copy; None when the backend lacks the kepler_files router.
+                    embed_url = self._signed_embed_url(saved_id, config["signed_link_ttl"])
             except Exception as exc:  # saving is best-effort; the provider link still works
                 save_error = str(exc)
                 log.exception("kepler_seedance_video: saving video into Open WebUI storage failed")
 
         await self._emit_status(emitter, f"{label}: done", done=True)
         if mode == "extend" and joined:
+            player_note = (
+                "The player and the saved copy show the full joined video."
+                if embed_url
+                else "The saved copy in KeplerAI is the full joined video; the player shows only the new segment."
+            )
             summary = (
-                f"Extended the clip to {total_duration}s total: the saved copy in KeplerAI is the full joined video "
-                f"(original + {params['duration']}s continuation); the provider link and the player show only the new "
-                f"{params['duration']}s segment. {params['resolution']}, {model} ({tier} tier) via {config['provider']}."
+                f"Extended the clip to {total_duration}s total (original + {params['duration']}s continuation). {player_note} "
+                f"{params['resolution']}, {model} ({tier} tier) via {config['provider']}."
             )
         else:
             verb = {
