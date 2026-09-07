@@ -1,28 +1,28 @@
 """
 title: Kepler Video Generator (Seedance)
-description: Generate short videos from a text prompt, an attached image, or several reference images/audio clips with ByteDance Seedance. Talks to BytePlus ModelArk directly (default) or Atlas Cloud.
+description: Generate, extend and edit short videos with ByteDance Seedance from text, attached images, reference images/audio/video. Talks to BytePlus ModelArk directly (default) or Atlas Cloud.
 author: Kepler Interactive (forked from the Atlas Cloud Media Generator by binyangzhu000-sudo & Haervwe)
 author_url: https://github.com/Kepler-Interactive/open-webui-tools
-version: 0.4.0
+version: 0.5.0
 license: MIT
 required_open_webui_version: 0.9.1
 """
 
 # Kepler changes versus the upstream atlascloud_media_tool.py:
 #   * PROVIDER valve: "byteplus" (ByteDance's own ModelArk API, default) or
-#     "atlascloud" (reseller). Same three tool functions either way.
+#     "atlascloud" (reseller). Same tool functions either way.
 #   * Finished videos are downloaded into Open WebUI file storage (SAVE_TO_OPENWEBUI)
-#     because ModelArk result URLs expire after 24 hours.
-#   * Video only. Image generation/editing removed so the model has fewer,
-#     clearer tools to choose from (KeplerAI already has image generation).
-#   * Local filesystem paths are NOT accepted as media inputs any more. The
-#     upstream tool would read any path the LLM passed and upload it, which is
-#     an exfiltration risk on a shared server.
+#     because ModelArk result URLs expire after 24 hours. Rich metadata is kept on the
+#     file (task id, seed, prompt, provider URL + expiry, chat id) so later edit / extend
+#     calls can find "the last clip" and hand ModelArk a URL it can fetch.
+#   * extend_video / edit_video / reference video (Seedance "Video 1" convention).
+#     ModelArk only accepts reference videos as public web URLs (base64 is rejected),
+#     so sources must be clips generated here within 24h or public https links.
+#   * Video only. Image generation/editing removed (KeplerAI already has image generation).
+#   * Local filesystem paths are NOT accepted as media inputs (exfiltration risk).
 #   * Open WebUI attachments are resolved through the Files/Storage layer.
-#   * "fast" / "best" quality tiers, duration and resolution caps (cost control),
-#     and a reference-to-video function that mirrors Dreamina's multi-reference
-#     workflow (@Image1 / @Audio1 prompt syntax, up to N references).
-#   * Elapsed-time status updates while the render is running.
+#   * Two quality tiers ("draft" / "hifi", hidden "mini"), duration and resolution caps,
+#     estimated progress bar, token usage + estimated cost in the result.
 
 import asyncio
 import base64
@@ -45,25 +45,6 @@ BYTEPLUS_MINI_MODEL = "dreamina-seedance-2-0-mini-260615"
 BYTEPLUS_FAST_MODEL = "dreamina-seedance-2-0-fast-260128"
 BYTEPLUS_BEST_MODEL = "dreamina-seedance-2-5-260628"
 
-# Observed render throughput on ModelArk (seconds of wall time per second of video), used only
-# to show an *estimated* progress bar - the API reports no percentage. Measured 2026-09-07:
-# 4s@480p no audio -> 70s, 5s@720p with audio -> 124s (Seedance 2.0 Fast).
-EST_SECONDS_PER_VIDEO_SECOND = {"480p": 15.0, "720p": 20.0, "1080p": 38.0}
-EST_OVERHEAD_SECONDS = 8.0
-EST_MODEL_FACTOR = {"mini": 0.7, "draft": 1.0, "hifi": 1.6}
-
-# Two user-facing tiers ("draft" / "hifi") plus a hidden "mini". Anything else the model passes is
-# mapped here; unknown values fall back to the DEFAULT_QUALITY valve.
-TIER_ALIASES = {
-    "draft": "draft", "fast": "draft", "quick": "draft", "standard": "draft", "default": "draft",
-    "hifi": "hifi", "hi-fi": "hifi", "high": "hifi", "high-fidelity": "hifi", "high_fidelity": "hifi",
-    "high fidelity": "hifi", "high quality": "hifi", "high-quality": "hifi", "hq": "hifi",
-    "best": "hifi", "final": "hifi", "premium": "hifi",
-    "mini": "mini", "cheap": "mini", "cheapest": "mini",
-}
-
-log = logging.getLogger("kepler_seedance_video")
-
 # --- Atlas Cloud (reseller) --------------------------------------------------
 ATLAS_BASE_URL = "https://api.atlascloud.ai/api/v1"
 ATLAS_VIDEO_ENDPOINT = "/model/generateVideo"
@@ -81,6 +62,29 @@ VALID_RATIOS = ("16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive")
 
 OWUI_FILE_ID_RE = re.compile(r"/api/v1/files/([0-9a-fA-F-]{8,})")
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+VIDEO1_RE = re.compile(r"video\s*1\b", re.IGNORECASE)
+
+# Observed render throughput on ModelArk (seconds of wall time per second of video), used only
+# to show an *estimated* progress bar - the API reports no percentage. Measured 2026-09-07:
+# 4s@480p no audio -> 70s, 5s@720p with audio -> 124s, 5s@480p with a reference video -> 86-124s.
+EST_SECONDS_PER_VIDEO_SECOND = {"480p": 15.0, "720p": 20.0, "1080p": 38.0}
+EST_OVERHEAD_SECONDS = 8.0
+EST_MODEL_FACTOR = {"mini": 0.7, "draft": 1.0, "hifi": 1.6}
+EST_VIDEO_INPUT_FACTOR = 1.4
+
+PROVIDER_URL_TTL_SECONDS = 24 * 3600
+
+# Two user-facing tiers ("draft" / "hifi") plus a hidden "mini". Anything else the model passes is
+# mapped here; unknown values fall back to the DEFAULT_QUALITY valve.
+TIER_ALIASES = {
+    "draft": "draft", "fast": "draft", "quick": "draft", "standard": "draft", "default": "draft",
+    "hifi": "hifi", "hi-fi": "hifi", "high": "hifi", "high-fidelity": "hifi", "high_fidelity": "hifi",
+    "high fidelity": "hifi", "high quality": "hifi", "high-quality": "hifi", "hq": "hifi",
+    "best": "hifi", "final": "hifi", "premium": "hifi",
+    "mini": "mini", "cheap": "mini", "cheapest": "mini",
+}
+
+log = logging.getLogger("kepler_seedance_video")
 
 EventEmitter = Optional[Callable[[dict[str, Any]], Awaitable[None]]]
 
@@ -152,6 +156,7 @@ class Tools:
         )
         DEFAULT_RESOLUTION: str = Field(default="720p")
         MAX_REFERENCE_IMAGES: int = Field(default=9, ge=1, le=30)
+        MAX_REFERENCE_VIDEOS: int = Field(default=3, ge=0, le=10)
         MAX_REFERENCE_AUDIO: int = Field(default=3, ge=0, le=10)
         POLL_INTERVAL_SECONDS: float = Field(default=5.0, ge=0.5)
         GENERATION_TIMEOUT_SECONDS: float = Field(default=600.0, ge=30.0)
@@ -206,6 +211,7 @@ class Tools:
             "allowed_resolutions": allowed,
             "default_resolution": self.valves.DEFAULT_RESOLUTION,
             "max_ref_images": self.valves.MAX_REFERENCE_IMAGES,
+            "max_ref_videos": self.valves.MAX_REFERENCE_VIDEOS,
             "max_ref_audio": self.valves.MAX_REFERENCE_AUDIO,
             "poll_interval": self.valves.POLL_INTERVAL_SECONDS,
             "timeout": self.valves.GENERATION_TIMEOUT_SECONDS,
@@ -293,7 +299,7 @@ class Tools:
         return raw, (meta.get("name") or file.filename or file_id), (meta.get("content_type") or "application/octet-stream")
 
     async def _resolve_media(self, media_input: str) -> MediaRef:
-        """Turn a data URI, Open WebUI file reference, or public URL into a MediaRef."""
+        """Turn a data URI, Open WebUI file reference, or public URL into a MediaRef (images/audio)."""
         if not media_input or not isinstance(media_input, str):
             raise VideoGenError("No valid media input provided.")
         s = media_input.strip()
@@ -320,20 +326,93 @@ class Tools:
 
         raise VideoGenError("Unsupported media reference. Attach the file to the chat or give a public https:// URL.")
 
+    @staticmethod
+    def _seedance_meta(file: Any) -> Dict[str, Any]:
+        meta = getattr(file, "meta", None) or {}
+        sd = meta.get("seedance") or {}
+        return sd if isinstance(sd, dict) else {}
+
+    @staticmethod
+    def _unexpired_provider_url(sd: Dict[str, Any]) -> Optional[str]:
+        url = sd.get("provider_url")
+        exp = sd.get("provider_url_expires_at") or 0
+        if url and exp and time.time() < float(exp) - 120:
+            return url
+        return None
+
+    async def _latest_generated_video(self, user_id: Optional[str], chat_id: Optional[str]) -> Optional[Any]:
+        """Most recent clip this tool generated for the user, preferring the current chat."""
+        if not user_id:
+            return None
+        try:
+            from open_webui.models.files import Files
+        except Exception:
+            return None
+        files = await Files.get_files_by_user_id(user_id)
+        mine = [f for f in files if self._seedance_meta(f).get("provider_url") or (f.meta or {}).get("source") == "kepler_seedance_video"]
+        if not mine:
+            return None
+        mine.sort(key=lambda f: f.created_at or 0, reverse=True)
+        if chat_id:
+            same_chat = [f for f in mine if self._seedance_meta(f).get("chat_id") == chat_id]
+            if same_chat:
+                return same_chat[0]
+        return mine[0]
+
+    async def _resolve_video_source(
+        self, source: Optional[str], user_id: Optional[str], chat_id: Optional[str]
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Return (public_url, seedance_meta) for a source video. ModelArk only fetches public web URLs,
+        so KeplerAI files are usable only via their stored provider URL (valid ~24h after generation)."""
+        s = (source or "").strip()
+        file = None
+
+        if not s:
+            file = await self._latest_generated_video(user_id, chat_id)
+            if not file:
+                raise VideoGenError("No previous video found in this chat. Generate a clip first, or give a public https:// video URL.")
+        else:
+            m = OWUI_FILE_ID_RE.search(s)
+            if m or UUID_RE.match(s):
+                try:
+                    from open_webui.models.files import Files
+                except Exception as exc:
+                    raise VideoGenError(f"Cannot access Open WebUI file storage: {exc}") from exc
+                file = await Files.get_file_by_id(m.group(1) if m else s)
+                if not file:
+                    raise VideoGenError("That KeplerAI file was not found.")
+            elif s.startswith("https://") or s.startswith("http://"):
+                return s, {}
+            else:
+                raise VideoGenError("Unsupported video reference. Use the last generated clip, a KeplerAI file link, or a public https:// URL.")
+
+        sd = self._seedance_meta(file)
+        url = self._unexpired_provider_url(sd)
+        if not url:
+            when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(file.created_at or 0))
+            raise VideoGenError(
+                f"The source clip (generated {when} UTC) can no longer be fetched by the video provider: "
+                "ByteDance only accepts public web URLs and its own links expire after 24 hours. "
+                "Regenerate the clip, or host the MP4 at a public https:// URL and pass that."
+            )
+        return url, sd
+
     def _collect_media(
         self,
         messages: Optional[List[Dict[str, Any]]],
         files: Optional[List[Dict[str, Any]]],
         media_type: str,
     ) -> List[str]:
-        """Collect image or audio references from __files__ and the latest user message that has any."""
+        """Collect image/audio/video references from __files__ and the latest user message that has any."""
         found: List[str] = []
 
         def match(f: Dict[str, Any]) -> Optional[str]:
             ctype = ((f.get("file") or {}).get("meta") or {}).get("content_type") or ""
             ftype = f.get("type") or ""
-            ok = (media_type == "image" and (ftype == "image" or ctype.startswith("image/"))) or (
-                media_type == "audio" and ctype.startswith("audio/")
+            ok = (
+                (media_type == "image" and (ftype == "image" or ctype.startswith("image/")))
+                or (media_type == "audio" and ctype.startswith("audio/"))
+                or (media_type == "video" and (ftype == "video" or ctype.startswith("video/")))
             )
             return (f.get("url") or f.get("id")) if ok else None
 
@@ -397,6 +476,7 @@ class Tools:
         first_frame: Optional[MediaRef] = None,
         ref_images: Optional[List[MediaRef]] = None,
         ref_audios: Optional[List[MediaRef]] = None,
+        ref_videos: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Submit a ModelArk video generation task; returns {url, tokens, task_id, seed}."""
         content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
@@ -404,12 +484,14 @@ class Tools:
             content.append({"type": "image_url", "image_url": {"url": first_frame.as_data_uri()}, "role": "first_frame"})
         for ref in ref_images or []:
             content.append({"type": "image_url", "image_url": {"url": ref.as_data_uri()}, "role": "reference_image"})
+        for url in ref_videos or []:
+            content.append({"type": "video_url", "video_url": {"url": url}, "role": "reference_video"})
         for ref in ref_audios or []:
             content.append({"type": "audio_url", "audio_url": {"url": ref.as_data_uri()}, "role": "reference_audio"})
 
         payload: Dict[str, Any] = {"model": model, "content": content, "watermark": False, **params}
-        # ModelArk only understands 'adaptive' when there is an image to adapt to.
-        if payload.get("ratio") == "adaptive" and not (first_frame or ref_images):
+        # ModelArk only understands 'adaptive' when there is visual input to adapt to.
+        if payload.get("ratio") == "adaptive" and not (first_frame or ref_images or ref_videos):
             payload["ratio"] = "16:9"
 
         headers = {"Authorization": f"Bearer {config['api_key']}", "Content-Type": "application/json"}
@@ -473,6 +555,7 @@ class Tools:
         first_frame: Optional[MediaRef] = None,
         ref_images: Optional[List[MediaRef]] = None,
         ref_audios: Optional[List[MediaRef]] = None,
+        ref_videos: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         headers = {"Authorization": f"Bearer {config['api_key']}"}
         base = config["atlas_base_url"]
@@ -482,6 +565,8 @@ class Tools:
                 payload["image_url"] = await self._atlas_upload(session, base, first_frame)
             if ref_images:
                 payload["reference_images"] = [await self._atlas_upload(session, base, r) for r in ref_images]
+            if ref_videos:
+                payload["reference_videos"] = list(ref_videos)
             if ref_audios:
                 payload["reference_audios"] = [await self._atlas_upload(session, base, r) for r in ref_audios]
 
@@ -538,7 +623,9 @@ class Tools:
 
         file_id = str(uuid.uuid4())
         stored_name = f"{file_id}_{filename}"
-        _, path = await asyncio.to_thread(Storage.upload_file, io.BytesIO(data), stored_name, {"OpenWebUI-User-Id": user_id, "OpenWebUI-File-Id": file_id})
+        _, path = await asyncio.to_thread(
+            Storage.upload_file, io.BytesIO(data), stored_name, {"OpenWebUI-User-Id": user_id, "OpenWebUI-File-Id": file_id}
+        )
         await Files.insert_new_file(
             user_id,
             FileForm(
@@ -566,7 +653,10 @@ class Tools:
         usage_note: str = "",
     ) -> Union[str, Tuple[HTMLResponse, str]]:
         if saved_url:
-            keep_note = f"A permanent copy is saved in KeplerAI at {saved_url} (open it or attach it in later chats)."
+            keep_note = (
+                f"A permanent copy is saved in KeplerAI at {saved_url}. It can be extended or edited "
+                "with the video tools for the next 24 hours by just asking (e.g. 'extend it', 'make the boat red')."
+            )
         else:
             keep_note = "The provider link expires in about 24 hours, so download the clip if you want to keep it."
             if save_error:
@@ -606,6 +696,9 @@ class Tools:
         first_frame: Optional[MediaRef] = None,
         ref_images: Optional[List[MediaRef]] = None,
         ref_audios: Optional[List[MediaRef]] = None,
+        ref_videos: Optional[List[str]] = None,
+        chat_id: Optional[str] = None,
+        source_url: Optional[str] = None,
     ) -> Union[str, Tuple[HTMLResponse, str]]:
         if not config["api_key"]:
             which = "BYTEPLUS_API_KEY" if config["provider"] == "byteplus" else "ATLASCLOUD_API_KEY"
@@ -616,7 +709,7 @@ class Tools:
         if mode == "reference":
             tier = "hifi"
         if config["provider"] == "byteplus":
-            # ModelArk uses one model id for text / first-frame / reference inputs.
+            # ModelArk uses one model id for text / first-frame / reference / edit / extend inputs.
             model = config["byteplus_models"][tier]
             runner = self._byteplus_generate
         else:
@@ -624,19 +717,22 @@ class Tools:
                 "text": config["atlas_best_model"] if tier == "hifi" else config["atlas_fast_model"],
                 "image": config["atlas_image_to_video_model"],
                 "reference": config["atlas_reference_model"],
+                "extend": config["atlas_reference_model"],
+                "edit": config["atlas_reference_model"],
             }[mode]
             runner = self._atlas_generate
 
         # Wall-time estimate for the progress bar (the API gives no percentage).
         rate = EST_SECONDS_PER_VIDEO_SECOND.get(params["resolution"], 25.0)
         audio_factor = 1.15 if params.get("generate_audio") else 1.0
-        config["est_total"] = EST_OVERHEAD_SECONDS + params["duration"] * rate * EST_MODEL_FACTOR[tier] * audio_factor
+        video_factor = EST_VIDEO_INPUT_FACTOR if ref_videos else 1.0
+        config["est_total"] = EST_OVERHEAD_SECONDS + params["duration"] * rate * EST_MODEL_FACTOR[tier] * audio_factor * video_factor
 
         await self._emit_status(
             emitter, f"Submitting to {model} ({config['provider']}, ~{int(config['est_total'])}s estimated)", done=False
         )
         try:
-            result = await runner(config, emitter, label, model, prompt, params, first_frame, ref_images, ref_audios)
+            result = await runner(config, emitter, label, model, prompt, params, first_frame, ref_images, ref_audios, ref_videos)
         except (VideoGenError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
             log.warning("kepler_seedance_video: generation failed: %s", exc)
             await self._emit_status(emitter, f"Video generation error: {exc}", done=True)
@@ -651,9 +747,9 @@ class Tools:
             if price > 0:
                 usage_note += f" (≈ ${tokens / 1_000_000 * price:.2f})"
         log.info(
-            "kepler_seedance_video: %s tier=%s model=%s duration=%ss res=%s tokens=%s task=%s user=%s",
-            config["provider"], tier, model, params["duration"], params["resolution"], tokens,
-            result.get("task_id"), (user or {}).get("id"),
+            "kepler_seedance_video: %s mode=%s tier=%s model=%s duration=%ss res=%s tokens=%s task=%s user=%s chat=%s",
+            config["provider"], mode, tier, model, params["duration"], params["resolution"], tokens,
+            result.get("task_id"), (user or {}).get("id"), chat_id,
         )
 
         saved_url, save_error = None, None
@@ -669,6 +765,7 @@ class Tools:
                             "provider": config["provider"],
                             "model": model,
                             "tier": tier,
+                            "mode": mode,
                             "task_id": result.get("task_id"),
                             "seed": result.get("seed"),
                             "tokens": tokens,
@@ -676,8 +773,10 @@ class Tools:
                             "duration": params["duration"],
                             "resolution": params["resolution"],
                             "ratio": params["ratio"],
+                            "chat_id": chat_id,
+                            "source_video": source_url,
                             "provider_url": provider_url,
-                            "provider_url_expires_at": int(time.time()) + 24 * 3600,
+                            "provider_url_expires_at": int(time.time()) + PROVIDER_URL_TTL_SECONDS,
                         }
                     },
                 )
@@ -688,13 +787,35 @@ class Tools:
                 log.exception("kepler_seedance_video: saving video into Open WebUI storage failed")
 
         await self._emit_status(emitter, f"{label}: done", done=True)
-        summary = f"Generated a {params['duration']}s {params['resolution']} clip with {model} ({tier} tier) via {config['provider']}."
+        verb = {
+            "text": "Generated",
+            "image": "Animated the attached image into",
+            "reference": "Generated from the references",
+            "extend": "Extended the source clip into",
+            "edit": "Edited the source clip into",
+        }.get(mode, "Generated")
+        summary = f"{verb} a {params['duration']}s {params['resolution']} clip with {model} ({tier} tier) via {config['provider']}."
         return self._render(provider_url, saved_url, config, summary, save_error, usage_note)
 
     async def _prepare_refs(self, emitter: EventEmitter, refs: List[str], kind: str) -> List[MediaRef]:
         if refs:
             await self._emit_status(emitter, f"Preparing {len(refs)} {kind} reference(s)", done=False)
         return [await self._resolve_media(r) for r in refs]
+
+    async def _prepare_video_refs(
+        self, emitter: EventEmitter, refs: List[str], user_id: Optional[str], chat_id: Optional[str]
+    ) -> List[str]:
+        out: List[str] = []
+        if refs:
+            await self._emit_status(emitter, f"Resolving {len(refs)} video reference(s)", done=False)
+        for r in refs:
+            url, _ = await self._resolve_video_source(r, user_id, chat_id)
+            out.append(url)
+        return out
+
+    @staticmethod
+    def _chat_id(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+        return (metadata or {}).get("chat_id") if isinstance(metadata, dict) else None
 
     # ------------------------------------------------------------------ tools
 
@@ -708,10 +829,12 @@ class Tools:
         quality: str = "",
         __event_emitter__: EventEmitter = None,
         __user__: Optional[Dict[str, Any]] = None,
+        __metadata__: Optional[Dict[str, Any]] = None,
     ) -> Union[str, Tuple[HTMLResponse, str]]:
         """
-        Generate a short video clip from a text prompt using ByteDance Seedance. Use this whenever the user asks to
-        make, create, render, or visualise a video, clip, animation, or motion concept and has NOT attached an image.
+        Generate a NEW short video clip from a text prompt using ByteDance Seedance. Use this when the user describes
+        a scene or asks for a video, clip, animation or motion concept and has NOT attached an image, and is NOT
+        asking to change or continue an existing clip (use edit_video / extend_video for that).
 
         Write the prompt as a shot description: subject, action, setting, camera movement (e.g. slow dolly in,
         handheld, aerial), lighting and style. You can direct timing with timestamps, e.g. "0-2s: ..., 2-5s: ...".
@@ -731,7 +854,10 @@ class Tools:
             "ratio": self._clamp_ratio(ratio),
             "generate_audio": bool(generate_audio),
         }
-        return await self._generate(config, __event_emitter__, __user__, "Rendering video", quality, "text", prompt, params)
+        return await self._generate(
+            config, __event_emitter__, __user__, "Rendering video", quality, "text", prompt, params,
+            chat_id=self._chat_id(__metadata__),
+        )
 
     async def generate_video_from_image(
         self,
@@ -743,6 +869,7 @@ class Tools:
         quality: str = "",
         __event_emitter__: EventEmitter = None,
         __user__: Optional[Dict[str, Any]] = None,
+        __metadata__: Optional[Dict[str, Any]] = None,
         __messages__: Optional[List[Dict[str, Any]]] = None,
         __files__: Optional[List[Dict[str, Any]]] = None,
     ) -> Union[str, Tuple[HTMLResponse, str]]:
@@ -773,13 +900,15 @@ class Tools:
             "generate_audio": bool(generate_audio),
         }
         return await self._generate(
-            config, __event_emitter__, __user__, "Animating image", quality, "image", prompt, params, first_frame=first_frame
+            config, __event_emitter__, __user__, "Animating image", quality, "image", prompt, params,
+            first_frame=first_frame, chat_id=self._chat_id(__metadata__),
         )
 
     async def generate_video_from_references(
         self,
         prompt: str,
         image_urls: Optional[List[str]] = None,
+        video_urls: Optional[List[str]] = None,
         audio_urls: Optional[List[str]] = None,
         duration: int = 5,
         resolution: str = "720p",
@@ -787,18 +916,21 @@ class Tools:
         generate_audio: bool = True,
         __event_emitter__: EventEmitter = None,
         __user__: Optional[Dict[str, Any]] = None,
+        __metadata__: Optional[Dict[str, Any]] = None,
         __messages__: Optional[List[Dict[str, Any]]] = None,
         __files__: Optional[List[Dict[str, Any]]] = None,
     ) -> Union[str, Tuple[HTMLResponse, str]]:
         """
-        Generate a video guided by SEVERAL reference assets (characters, props, environments, style frames, audio),
-        like Dreamina's multi-reference mode. Use this when the user attached two or more images, or an audio clip,
-        and wants them combined or kept consistent in the video. References are picked up from the chat
-        automatically. In the prompt, cite them in attachment order as @Image1, @Image2, @Audio1, e.g.
-        "@Image1 walks through the market from @Image2, cinematic, 35mm". Always uses the high-quality model.
+        Generate a NEW video guided by SEVERAL reference assets - characters, props, environments, style frames,
+        audio, or a video whose camera/motion/style should be matched. Use this when the user attached two or more
+        images, an audio clip, or wants a previous clip used as a style/motion reference for a different scene.
+        References are picked up from the chat automatically. In the prompt, cite them in order as
+        "Image 1", "Image 2", "Video 1", "Audio 1", e.g. "Image 1 walks through the market from Image 2, matching
+        the camera movement of Video 1". Always uses the high-fidelity model.
 
-        :param prompt: Shot description using @Image1/@Image2/@Audio1 to cite the references.
+        :param prompt: Shot description citing the references as Image 1 / Video 1 / Audio 1.
         :param image_urls: Optional explicit public https:// image URLs. Leave empty to use attachments.
+        :param video_urls: Optional reference videos: public https:// URLs, KeplerAI file links, or "last" for the most recent clip generated in this chat. Leave empty to use attachments.
         :param audio_urls: Optional explicit public https:// audio URLs. Leave empty to use attachments.
         :param duration: Clip length in seconds (4-10). Default 5.
         :param resolution: 480p, 720p or 1080p. Default 720p.
@@ -806,15 +938,19 @@ class Tools:
         :param generate_audio: Whether to generate synchronised sound. Default true.
         """
         config = self._resolve_config(__user__)
+        user_id, chat_id = (__user__ or {}).get("id"), self._chat_id(__metadata__)
         images = (list(image_urls or []) or self._collect_media(__messages__, __files__, "image"))[: config["max_ref_images"]]
+        videos = (list(video_urls or []) or self._collect_media(__messages__, __files__, "video"))[: config["max_ref_videos"]]
         audios = (list(audio_urls or []) or self._collect_media(__messages__, __files__, "audio"))[: config["max_ref_audio"]]
-        if not images and not audios:
-            return "No reference images or audio found. Ask the user to attach them, then call this tool again."
+        videos = ["" if str(v).strip().lower() in ("last", "latest", "previous") else v for v in videos]
+        if not images and not audios and not videos:
+            return "No reference images, videos or audio found. Ask the user to attach them, then call this tool again."
         try:
             ref_images = await self._prepare_refs(__event_emitter__, images, "image")
             ref_audios = await self._prepare_refs(__event_emitter__, audios, "audio")
+            ref_videos = await self._prepare_video_refs(__event_emitter__, videos, user_id, chat_id)
         except (VideoGenError, OSError) as exc:
-            return f"Could not read the reference assets: {exc}"
+            return f"Could not prepare the reference assets: {exc}"
         params = {
             "duration": self._clamp_duration(duration, config),
             "resolution": self._clamp_resolution(resolution, config),
@@ -822,6 +958,108 @@ class Tools:
             "generate_audio": bool(generate_audio),
         }
         return await self._generate(
-            config, __event_emitter__, __user__, "Rendering from references", "best", "reference", prompt, params,
-            ref_images=ref_images, ref_audios=ref_audios,
+            config, __event_emitter__, __user__, "Rendering from references", "hifi", "reference", prompt, params,
+            ref_images=ref_images, ref_audios=ref_audios, ref_videos=ref_videos, chat_id=chat_id,
+            source_url=ref_videos[0] if ref_videos else None,
+        )
+
+    async def extend_video(
+        self,
+        prompt: str,
+        source_video: str = "",
+        duration: int = 5,
+        resolution: str = "",
+        generate_audio: bool = True,
+        quality: str = "",
+        __event_emitter__: EventEmitter = None,
+        __user__: Optional[Dict[str, Any]] = None,
+        __metadata__: Optional[Dict[str, Any]] = None,
+        __messages__: Optional[List[Dict[str, Any]]] = None,
+        __files__: Optional[List[Dict[str, Any]]] = None,
+    ) -> Union[str, Tuple[HTMLResponse, str]]:
+        """
+        CONTINUE an existing clip: generates the next few seconds after the source video ends, keeping the same
+        subject, setting, camera and style. Use when the user says things like "extend it", "continue the video",
+        "what happens next", "make it longer". By default the source is the most recent clip generated in this chat,
+        so you usually do not need to pass source_video. The result is a new clip of the continuation only.
+
+        :param prompt: What should happen next (e.g. "the boat reaches the edge of the puddle and stops"). Write it as a continuation; the tool adds the technical framing.
+        :param source_video: Leave empty for the last clip generated in this chat. Otherwise a KeplerAI file link or a public https:// video URL. Clips older than 24 hours cannot be used.
+        :param duration: Length of the continuation in seconds (4-10). Default 5.
+        :param resolution: Leave empty to match the source clip; or 480p, 720p, 1080p.
+        :param generate_audio: Whether to generate synchronised sound. Default true.
+        :param quality: Leave empty for the configured default; "draft" or "hifi".
+        """
+        config = self._resolve_config(__user__)
+        user_id, chat_id = (__user__ or {}).get("id"), self._chat_id(__metadata__)
+        src = source_video or next(iter(self._collect_media(__messages__, __files__, "video")), "")
+        try:
+            src_url, src_meta = await self._resolve_video_source(src, user_id, chat_id)
+        except VideoGenError as exc:
+            return f"Cannot extend: {exc}"
+        text = prompt.strip()
+        if not VIDEO1_RE.search(text):
+            text = (
+                f"Extend Video 1 forward: {text.rstrip('.')}. Keep the same subject, setting, camera angle, "
+                "lighting and visual style as Video 1 so the continuation cuts together seamlessly."
+            )
+        params = {
+            "duration": self._clamp_duration(duration, config),
+            "resolution": self._clamp_resolution(resolution or src_meta.get("resolution"), config),
+            "ratio": self._clamp_ratio(src_meta.get("ratio") or "adaptive"),
+            "generate_audio": bool(generate_audio),
+        }
+        return await self._generate(
+            config, __event_emitter__, __user__, "Extending video", quality or src_meta.get("tier") or "", "extend", text, params,
+            ref_videos=[src_url], chat_id=chat_id, source_url=src_url,
+        )
+
+    async def edit_video(
+        self,
+        prompt: str,
+        source_video: str = "",
+        resolution: str = "",
+        generate_audio: bool = True,
+        quality: str = "",
+        __event_emitter__: EventEmitter = None,
+        __user__: Optional[Dict[str, Any]] = None,
+        __metadata__: Optional[Dict[str, Any]] = None,
+        __messages__: Optional[List[Dict[str, Any]]] = None,
+        __files__: Optional[List[Dict[str, Any]]] = None,
+    ) -> Union[str, Tuple[HTMLResponse, str]]:
+        """
+        CHANGE something in an existing clip while keeping everything else: swap or recolour an object, change the
+        weather, time of day, outfit, background, etc. Use when the user asks to modify, tweak, replace or change
+        part of a video they already generated ("make the boat red", "make it night time", "remove the leaf").
+        By default the source is the most recent clip generated in this chat. The output has the same length,
+        framing and motion as the source.
+
+        :param prompt: The change to make, e.g. "replace the white paper boat with a red one". The tool adds the keep-everything-else framing.
+        :param source_video: Leave empty for the last clip generated in this chat. Otherwise a KeplerAI file link or a public https:// video URL. Clips older than 24 hours cannot be used.
+        :param resolution: Leave empty to match the source clip; or 480p, 720p, 1080p.
+        :param generate_audio: Whether to generate synchronised sound. Default true.
+        :param quality: Leave empty for the configured default; "draft" or "hifi".
+        """
+        config = self._resolve_config(__user__)
+        user_id, chat_id = (__user__ or {}).get("id"), self._chat_id(__metadata__)
+        src = source_video or next(iter(self._collect_media(__messages__, __files__, "video")), "")
+        try:
+            src_url, src_meta = await self._resolve_video_source(src, user_id, chat_id)
+        except VideoGenError as exc:
+            return f"Cannot edit: {exc}"
+        text = prompt.strip()
+        if not VIDEO1_RE.search(text):
+            text = (
+                f"In Video 1, {text[0].lower() + text[1:] if text else text}".rstrip(".")
+                + ". Keep the camera, framing, motion, timing, lighting and everything else exactly the same as Video 1."
+            )
+        params = {
+            "duration": self._clamp_duration(src_meta.get("duration") or config["default_duration"], config),
+            "resolution": self._clamp_resolution(resolution or src_meta.get("resolution"), config),
+            "ratio": self._clamp_ratio(src_meta.get("ratio") or "adaptive"),
+            "generate_audio": bool(generate_audio),
+        }
+        return await self._generate(
+            config, __event_emitter__, __user__, "Editing video", quality or src_meta.get("tier") or "", "edit", text, params,
+            ref_videos=[src_url], chat_id=chat_id, source_url=src_url,
         )
