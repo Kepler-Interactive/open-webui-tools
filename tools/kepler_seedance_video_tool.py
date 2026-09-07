@@ -3,7 +3,7 @@ title: Kepler Video Generator (Seedance)
 description: Generate, extend and edit short videos with ByteDance Seedance from text, attached images, reference images/audio/video. Talks to BytePlus ModelArk directly (default) or Atlas Cloud.
 author: Kepler Interactive (forked from the Atlas Cloud Media Generator by binyangzhu000-sudo & Haervwe)
 author_url: https://github.com/Kepler-Interactive/open-webui-tools
-version: 0.10.1
+version: 0.11.0
 license: MIT
 required_open_webui_version: 0.9.1
 """
@@ -499,6 +499,31 @@ class Tools:
             return 255.0
         return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
 
+    @staticmethod
+    def _vresample(frame: bytes, w: int, h: int, s: float) -> bytes:
+        """Stretch a gray raster vertically by factor s about its centre (nearest neighbour), same size out."""
+        fill = bytes([sum(frame) // len(frame)]) * w
+        rows = []
+        for y in range(h):
+            sy = int(round((y - h / 2) / s + h / 2))
+            rows.append(frame[sy * w:(sy + 1) * w] if 0 <= sy < h else fill)
+        return b"".join(rows)
+
+    def _best_vscale(self, ref: bytes, frame: bytes, w: int, h: int) -> Tuple[float, float, float]:
+        """Vertical scale factor to apply to `frame` so it best matches `ref`.
+
+        Seedance renders reference-based continuations at its own native aspect (~1.74:1) and stretches them
+        to the requested 16:9 frame, so they arrive ~2% vertically compressed relative to the source clip.
+        Returns (factor, mad_before, mad_after)."""
+        before = self._mad(ref, frame)
+        best_s, best_d = 1.0, before
+        for i in range(-12, 17):  # 0.94 .. 1.08 in 0.005 steps
+            s = 1.0 + i * 0.005
+            d = self._mad(ref, self._vresample(frame, w, h, s))
+            if d < best_d - 1e-6:
+                best_s, best_d = s, d
+        return round(best_s, 3), before, best_d
+
     def _best_cut_point(self, ffmpeg: str, a: str, b: str, window_s: float, fps: int = 24) -> Tuple[float, Dict[str, Any]]:
         """Where to start the continuation so it joins the source most seamlessly.
 
@@ -551,29 +576,50 @@ class Tools:
             db_eff = max(db - cut, 0.5)
             self._last_cut = cut
 
+            # Geometry match: the continuation usually arrives slightly vertically compressed (see
+            # _best_vscale). Measure it against the source's last frame and stretch it back, cropping the
+            # sliver that overflows, so the seam has no size jump and the rest of the clip matches too.
+            geom = ""
+            try:
+                gw, gh = 320, 180
+                ref = self._gray_frames(ffmpeg, a, ["-sseof", "-0.15"], gw, gh)[-1]
+                probe_frames = self._gray_frames(ffmpeg, b, ["-ss", str(cut), "-t", "0.2"], gw, gh)
+                if probe_frames:
+                    vs, d0, d1 = self._best_vscale(ref, probe_frames[0], gw, gh)
+                    log.info("kepler_seedance_video: stitch geometry vscale=%.3f (frame diff %.2f -> %.2f)", vs, d0, d1)
+                    if abs(vs - 1.0) >= 0.0075:
+                        if vs > 1:
+                            geom = f"scale={w}:{int(round(h * vs))},crop={w}:{h},"
+                        else:
+                            geom = f"scale={int(round(w / vs))}:{h},crop={w}:{h},"
+            except Exception as exc:
+                log.warning("kepler_seedance_video: geometry match skipped (%s)", exc)
+
             trim_v = f"trim=start={cut},setpts=PTS-STARTPTS," if cut > 0 else ""
             trim_a = f"atrim=start={cut},asetpts=PTS-STARTPTS," if cut > 0 else ""
             scale = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24"
+            # The continuation is stretched to the source frame exactly as it was measured, then geometry-fixed.
+            scale_b = f"scale={w}:{h},{geom}setsar=1,fps=24"
             xf = min(float(crossfade or 0), 2.0)
             use_xfade = xf > 0.04 and da > xf + 0.5 and db_eff > xf + 0.5
             if use_xfade:
                 off = round(da - xf, 3)
                 total = da + db_eff - xf
                 if with_audio:
-                    fc = (f"[0:v]{scale}[v0];[1:v]{trim_v}{scale}[v1];[v0][v1]xfade=transition=fade:duration={xf}:offset={off}[v];"
+                    fc = (f"[0:v]{scale}[v0];[1:v]{trim_v}{scale_b}[v1];[v0][v1]xfade=transition=fade:duration={xf}:offset={off}[v];"
                           f"[0:a]aresample=48000[a0];[1:a]{trim_a}aresample=48000[a1];[a0][a1]acrossfade=d={xf}[a]")
                     maps = ["-map", "[v]", "-map", "[a]", "-c:a", "aac", "-b:a", "128k"]
                 else:
-                    fc = f"[0:v]{scale}[v0];[1:v]{trim_v}{scale}[v1];[v0][v1]xfade=transition=fade:duration={xf}:offset={off}[v]"
+                    fc = f"[0:v]{scale}[v0];[1:v]{trim_v}{scale_b}[v1];[v0][v1]xfade=transition=fade:duration={xf}:offset={off}[v]"
                     maps = ["-map", "[v]", "-an"]
             else:
                 total = da + db_eff
                 if with_audio:
-                    fc = (f"[0:v]{scale}[v0];[1:v]{trim_v}{scale}[v1];[0:a]aresample=48000[a0];[1:a]{trim_a}aresample=48000[a1];"
+                    fc = (f"[0:v]{scale}[v0];[1:v]{trim_v}{scale_b}[v1];[0:a]aresample=48000[a0];[1:a]{trim_a}aresample=48000[a1];"
                           f"[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]")
                     maps = ["-map", "[v]", "-map", "[a]", "-c:a", "aac", "-b:a", "128k"]
                 else:
-                    fc = f"[0:v]{scale}[v0];[1:v]{trim_v}{scale}[v1];[v0][v1]concat=n=2:v=1:a=0[v]"
+                    fc = f"[0:v]{scale}[v0];[1:v]{trim_v}{scale_b}[v1];[v0][v1]concat=n=2:v=1:a=0[v]"
                     maps = ["-map", "[v]", "-an"]
             cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", a, "-i", b, "-filter_complex", fc, *maps,
                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart", out]
