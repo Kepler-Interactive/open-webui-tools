@@ -57,6 +57,7 @@ EST_MODEL_FACTOR = {"mini": 0.7, "draft": 1.0, "hifi": 1.6}
 TIER_ALIASES = {
     "draft": "draft", "fast": "draft", "quick": "draft", "standard": "draft", "default": "draft",
     "hifi": "hifi", "hi-fi": "hifi", "high": "hifi", "high-fidelity": "hifi", "high_fidelity": "hifi",
+    "high fidelity": "hifi", "high quality": "hifi", "high-quality": "hifi", "hq": "hifi",
     "best": "hifi", "final": "hifi", "premium": "hifi",
     "mini": "mini", "cheap": "mini", "cheapest": "mini",
 }
