@@ -3,7 +3,7 @@ title: Kepler Video Generator (Seedance)
 description: Generate, extend and edit short videos with ByteDance Seedance from text, attached images, reference images/audio/video. Talks to BytePlus ModelArk directly (default) or Atlas Cloud.
 author: Kepler Interactive (forked from the Atlas Cloud Media Generator by binyangzhu000-sudo & Haervwe)
 author_url: https://github.com/Kepler-Interactive/open-webui-tools
-version: 0.11.1
+version: 0.11.2
 license: MIT
 required_open_webui_version: 0.9.1
 """
@@ -179,8 +179,8 @@ class Tools:
             description="Search this many seconds at the start of a continuation for the frame that best matches the source's last frame, skip the near-static onset, and cut there. 0 disables.",
         )
         JOIN_CROSSFADE_SECONDS: float = Field(
-            default=0.08, ge=0.0, le=2.0,
-            description="Blend length at the cut point. With the anchor and geometry match in place a near-hard cut (2 frames) looks cleanest; longer blends read as a brief defocus. 0 = hard cut.",
+            default=0.125, ge=0.0, le=2.0,
+            description="Blend length at the cut point. With the anchor and geometry match in place a very short blend (3 frames) looks cleanest; longer blends read as a brief defocus. 0 = hard cut. Values under 0.125 are raised to 0.125 (ffmpeg's xfade drops frames below that).",
         )
         MAX_RERENDER_SECONDS: int = Field(
             default=30, ge=4, le=30,
@@ -602,6 +602,8 @@ class Tools:
             scale_b = f"scale={w}:{h}:flags=lanczos,{geom}setsar=1,fps=24"
             xf = min(float(crossfade or 0), 2.0)
             use_xfade = xf > 0.03 and da > xf + 0.5 and db_eff > xf + 0.5
+            if use_xfade and xf < 0.125:
+                xf = 0.125  # measured: xfade shorter than 3 frames at 24fps halves the output frame rate
             if use_xfade:
                 off = round(da - xf, 3)
                 total = da + db_eff - xf
